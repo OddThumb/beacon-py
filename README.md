@@ -45,32 +45,12 @@ This is the **Python implementation** of the BEACON pipeline. For the R version,
 
 ## Installation
 
-### From PyPI (when published)
-
-```bash
-pip install beacon-py
-```
-
 ### From Source
 
 ```bash
 git clone https://github.com/OddThumb/beacon-py.git
 cd beacon-py
 pip install .
-```
-
-### For Development
-
-```bash
-git clone https://github.com/OddThumb/beacon-py.git
-cd beacon-py
-pip install -e ".[dev]"
-```
-
-### With PyCBC Support
-
-```bash
-pip install "beacon-py[pycbc]"
 ```
 
 ## Requirements

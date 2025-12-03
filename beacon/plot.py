@@ -2,7 +2,8 @@ from __future__ import annotations
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter, MaxNLocator
-from .QT import qtransform
+
+# from .QT import qtransform
 from matplotlib.colors import Normalize
 import seaborn as sns
 import polars as pl
@@ -11,6 +12,13 @@ from .etc import Rist  # For R-style list container
 from cycler import cycler
 from cmap import Colormap
 import matplotlib.colors as mcolors
+
+try:
+    from pycbc.types import TimeSeries
+
+    PYCBC_AVAILABLE = True
+except ImportError:
+    PYCBC_AVAILABLE = False
 
 # Okabe–Ito colormap
 cm = Colormap("okabeito:okabeito")
@@ -272,16 +280,24 @@ def plot_spectro(
         - When stack=False, use figsize_spec and figsize_osci for better proportions
 
     References:
-        - GWpy Q-transform: https://gwpy.github.io/docs/latest/examples/timeseries/qscan/
+        - PyCBC Q-transform: https://pycbc.org/pycbc/latest/html/_modules/pycbc/filter/qtransform.html
     """
+
+    if not PYCBC_AVAILABLE:
+        raise ImportError(
+            "PyCBC is required for this function. " "Install with: pip install pycbc"
+        )
+
     # Time crop
     if trange is None:
         trange = ts_obj.trange
     ts_crop = ts_obj.window(*trange)
 
     # Q-transform
-    qres = qtransform(
-        ts_crop,
+    times, freqs, power = TimeSeries.qtransform(
+        # qres = qtransform(
+        # ts_crop,
+        ts_crop.to_pycbc(),
         delta_t=1 / tres,
         delta_f=None if logf else 1 / fres,
         logfsteps=fres if logf else None,
@@ -290,10 +306,10 @@ def plot_spectro(
         mismatch=0.2,
         return_complex=False,
     )
-
-    times = qres["times"] - tzero
-    freqs = qres["freqs"]
-    power = qres["q_plane"].T
+    times = times - tzero
+    # times = qres["times"] - tzero
+    # freqs = qres["freqs"]
+    # power = qres["q_plane"].T
 
     if transform:
         power = transform(power)

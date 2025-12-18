@@ -233,7 +233,7 @@ def burgar(
 
     Args:
         x (array-like): Input time series data.
-        ic (str or bool, optional): Information criterion to select model order ('AIC', 'BIC', 'FPE', or bool). Defaults to True.
+        ic (str or bool, optional): Information criterion to select model order ('AIC', 'BIC', 'FPE', 'AICc', 'KIC', 'AKICc', or bool). Defaults to True.
         order_max (int, optional): Maximum AR order. If None, computed automatically.
         demean (bool, optional): Whether to remove the mean before fitting. Defaults to True.
         var_method (int, optional): Innovation variance method (1 or 2). Defaults to 2.
@@ -249,11 +249,34 @@ def burgar(
             - 'n_used': Number of samples.
             - 'order_max': Maximum AR order considered.
             - 'partialacf': Partial autocorrelations.
-            - 'resid': Residual series.
             - 'method': Method description.
             - 'series': Input label.
             - 'asy_var_coef': Asymptotic variance of coefficients (None).
     """
+
+    # Information criterion sub-functions
+    def AIC(order_max: int, vars_pred: np.ndarray, n_used: int) -> np.ndarray:
+        return 2 * np.arange(order_max + 1) + n_used * np.log(vars_pred)
+
+    def BIC(order_max: int, vars_pred: np.ndarray, n_used: int) -> np.ndarray:
+        return np.arange(order_max + 1) * np.log(n_used) + n_used * np.log(vars_pred)
+
+    def FPE(order_max: int, vars_pred: np.ndarray, n_used: int) -> np.ndarray:
+        orders = np.arange(order_max + 1)
+        return (n_used + (orders + 1)) / (n_used - (orders + 1)) * vars_pred
+
+    def AICc(order_max: int, vars_pred: np.ndarray, n_used: int) -> np.ndarray:
+        orders = np.arange(order_max + 1)
+        return n_used * np.log(vars_pred) + 2 * orders + (2 * orders * (orders + 1)) / (n_used - orders - 1)
+
+    def KIC(order_max: int, vars_pred: np.ndarray, n_used: int) -> np.ndarray:
+        orders = np.arange(order_max + 1)
+        return n_used * np.log(vars_pred) + 3 * orders
+
+    def AKICc(order_max: int, vars_pred: np.ndarray, n_used: int) -> np.ndarray:
+        orders = np.arange(order_max + 1)
+        return n_used * np.log(vars_pred) + 3 * orders + (3 * orders * (orders + 1)) / (n_used - orders - 1)
+
     x = np.asarray(x, dtype=np.float64).ravel()
     n_used = x.size
 
@@ -297,23 +320,20 @@ def burgar(
         )
         ic_label = "default"
     else:
-        if ic == "AIC":
-            xic = 2 * np.arange(order_max + 1) + n_used * np.log(vars_pred)
-            ic_label = "AIC"
-        elif ic == "BIC":
-            xic = (np.log(n_used) * np.arange(order_max + 1)) + n_used * np.log(
-                vars_pred
-            )
-            ic_label = "BIC"
-        elif ic == "FPE":
-            xic = (
-                (n_used + (np.arange(order_max + 1) + 1))
-                / (n_used - (np.arange(order_max + 1) + 1))
-                * vars_pred
-            )
-            ic_label = "FPE"
-        else:
+        ic_fun = {
+            "AIC": AIC,
+            "BIC": BIC,
+            "FPE": FPE,
+            "AICc": AICc,
+            "KIC": KIC,
+            "AKICc": AKICc,
+        }.get(ic)
+
+        if ic_fun is None:
             raise ValueError(f"Unknown ic: {ic}")
+
+        xic = ic_fun(order_max, vars_pred, n_used)
+        ic_label = ic
 
     # Normalize IC
     mic = np.nanmin(xic)
@@ -336,17 +356,6 @@ def burgar(
         ar = np.array([])
     var_pred = vars_pred[selected_order]
 
-    # Residuals
-    if selected_order > 0:
-        m = selected_order + 1
-        X_emb = np.lib.stride_tricks.sliding_window_view(x, window_shape=m)
-        X_emb = X_emb[:, ::-1]  # In reverse order
-        resid = np.concatenate(
-            [np.full(selected_order, np.nan), X_emb @ np.r_[1.0, -ar]]
-        )
-    else:
-        resid = x
-
     # Comments in burgar() of R source file
     # WE DON'T NEED THIS WHICH TAKES TIME A LOT!
     # if (order) {
@@ -368,7 +377,6 @@ def burgar(
             "n_used": n_used,
             "order_max": order_max,
             "partialacf": partialacf,
-            "resid": resid,
             "method": f"Burg{var_method}",
             "series": "x",
             "asy_var_coef": None,
@@ -408,7 +416,7 @@ def residual(x: Union[np.ndarray, Sequence[float]], ar: np.ndarray) -> np.ndarra
     ar = np.asarray(ar, dtype=np.float64).ravel()
 
     # Construct AR coef vector: 1 - a_1 - a_2 - ...
-    a = np.r_[1.0, -ar]
+    a = np.insert(-ar, 0, 1.0)
     order = len(ar)
 
     # Faster than embed-based calculation of residual
@@ -446,7 +454,7 @@ def sar(
     **kwargs: Any,
 ) -> Rist:
     """
-    Fit a single autoregressive (AR) model using Burg's method and return residuals and features.
+    Fit a single autoregressive (AR) model using Burg's method and return zero-phase residuals and features.
 
     Args:
         ts_obj (ts): Input time series object.
@@ -457,7 +465,7 @@ def sar(
 
     Returns:
         Rist: Container with:
-            - resid: Residual time series as `ts` object (NA padding removed).
+            - resid: Zero-phase residual time series as `ts` object (NA padding removed).
             - feature: pd.Series of AR coefficients, innovation variance, and input mean.
             - p_order: Selected AR order.
             - ar_collector: Always "single" for SAR.
@@ -466,7 +474,9 @@ def sar(
     ar_result = burgar(ts_obj.data, ic=ic, order_max=order_max, **kwargs)
     p = ar_result.order
 
-    resids_no_na = ar_result.resid[p:]
+    # Compute zero-phase residuals using the residual() function
+    resids_zp = residual(ts_obj.data, ar_result.ar)
+    resids_no_na = resids_zp[~np.isnan(resids_zp)]
     new_start = ts_obj.start + p / ts_obj.sampling_freq
     resids_ts = ts(resids_no_na, start=new_start, sampling_freq=ts_obj.sampling_freq)
 

@@ -222,7 +222,7 @@ def Differencing(
 # Estimate AR model coefficients using Burg's method
 def burgar(
     x: Union[np.ndarray, Sequence[float]],
-    ic: Union[str, bool] = True,
+    ic: str = "AIC",
     order_max: Optional[int] = None,
     demean: bool = True,
     var_method: int = 2,
@@ -233,7 +233,7 @@ def burgar(
 
     Args:
         x (array-like): Input time series data.
-        ic (str or bool, optional): Information criterion to select model order ('AIC', 'BIC', 'FPE', 'AICc', 'KIC', 'AKICc', or bool). Defaults to True.
+        ic (str, optional): Information criterion to select model order ('AIC', 'BIC', 'FPE', 'AICc', 'KIC', 'AKICc'). Defaults to 'AIC'.
         order_max (int, optional): Maximum AR order. If None, computed automatically.
         demean (bool, optional): Whether to remove the mean before fitting. Defaults to True.
         var_method (int, optional): Innovation variance method (1 or 2). Defaults to 2.
@@ -255,27 +255,32 @@ def burgar(
     """
 
     # Information criterion sub-functions
-    def AIC(order_max: int, vars_pred: np.ndarray, n_used: int) -> np.ndarray:
-        return 2 * np.arange(order_max + 1) + n_used * np.log(vars_pred)
-
-    def BIC(order_max: int, vars_pred: np.ndarray, n_used: int) -> np.ndarray:
-        return np.arange(order_max + 1) * np.log(n_used) + n_used * np.log(vars_pred)
-
-    def FPE(order_max: int, vars_pred: np.ndarray, n_used: int) -> np.ndarray:
+    def AIC(order_max: int, vars_pred: np.ndarray, n_used: int, demean: bool = False) -> np.ndarray:
         orders = np.arange(order_max + 1)
-        return (n_used + (orders + 1)) / (n_used - (orders + 1)) * vars_pred
+        return 2 * orders + n_used * np.log(vars_pred) + 2 * int(demean)
 
-    def AICc(order_max: int, vars_pred: np.ndarray, n_used: int) -> np.ndarray:
+    def BIC(order_max: int, vars_pred: np.ndarray, n_used: int, demean: bool = False) -> np.ndarray:
         orders = np.arange(order_max + 1)
-        return n_used * np.log(vars_pred) + 2 * orders + (2 * orders * (orders + 1)) / (n_used - orders - 1)
+        return orders * np.log(n_used) + n_used * np.log(vars_pred) + int(demean) * np.log(n_used)
 
-    def KIC(order_max: int, vars_pred: np.ndarray, n_used: int) -> np.ndarray:
+    def FPE(order_max: int, vars_pred: np.ndarray, n_used: int, demean: bool = False) -> np.ndarray:
         orders = np.arange(order_max + 1)
-        return n_used * np.log(vars_pred) + 3 * orders
+        k = orders + int(demean)
+        return (n_used + k + 1) / (n_used - k - 1) * vars_pred
 
-    def AKICc(order_max: int, vars_pred: np.ndarray, n_used: int) -> np.ndarray:
+    def AICc(order_max: int, vars_pred: np.ndarray, n_used: int, demean: bool = False) -> np.ndarray:
         orders = np.arange(order_max + 1)
-        return n_used * np.log(vars_pred) + 3 * orders + (3 * orders * (orders + 1)) / (n_used - orders - 1)
+        k = orders + int(demean)
+        return n_used * np.log(vars_pred) + 2 * k + (2 * k * (k + 1)) / (n_used - k - 1)
+
+    def KIC(order_max: int, vars_pred: np.ndarray, n_used: int, demean: bool = False) -> np.ndarray:
+        orders = np.arange(order_max + 1)
+        return n_used * np.log(vars_pred) + 3 * orders + 3 * int(demean)
+
+    def AKICc(order_max: int, vars_pred: np.ndarray, n_used: int, demean: bool = False) -> np.ndarray:
+        orders = np.arange(order_max + 1)
+        k = orders + int(demean)
+        return n_used * np.log(vars_pred) + 3 * k + (3 * k * (k + 1)) / (n_used - k - 1)
 
     x = np.asarray(x, dtype=np.float64).ravel()
     n_used = x.size
@@ -312,42 +317,26 @@ def burgar(
         raise ValueError("zero-variance series")
 
     # Information criteria
-    if isinstance(ic, bool):
-        xic = (
-            n_used * np.log(vars_pred)
-            + 2 * (np.arange(order_max + 1))
-            + 2 * int(demean)
-        )
-        ic_label = "default"
-    else:
-        ic_fun = {
-            "AIC": AIC,
-            "BIC": BIC,
-            "FPE": FPE,
-            "AICc": AICc,
-            "KIC": KIC,
-            "AKICc": AKICc,
-        }.get(ic)
+    ic_fun = {
+        "AIC": AIC,
+        "BIC": BIC,
+        "FPE": FPE,
+        "AICc": AICc,
+        "KIC": KIC,
+        "AKICc": AKICc,
+    }.get(ic)
 
-        if ic_fun is None:
-            raise ValueError(f"Unknown ic: {ic}")
+    if ic_fun is None:
+        raise ValueError(f"Unknown ic: {ic}. Must be one of 'AIC', 'BIC', 'FPE', 'AICc', 'KIC', 'AKICc'")
 
-        xic = ic_fun(order_max, vars_pred, n_used)
-        ic_label = ic
+    xic = ic_fun(order_max, vars_pred, n_used, demean)
 
     # Normalize IC
     mic = np.nanmin(xic)
     xic_norm = np.where(np.isfinite(mic), xic - mic, np.where(xic == mic, 0, np.inf))
-    # xic_dict = dict(zip(range(order_max + 1), xic_norm))
-    attr_ic = ic_label
 
-    # Select order
-    if isinstance(ic, bool) and ic is True:
-        selected_order = np.flatnonzero(xic_norm == 0)[0]
-    elif isinstance(ic, bool) and ic is False:
-        selected_order = order_max
-    else:
-        selected_order = np.flatnonzero(xic_norm == 0)[0]
+    # Select order (choose order with minimum IC)
+    selected_order = np.flatnonzero(xic_norm == 0)[0]
 
     # AR coefficients
     if selected_order > 0:
@@ -449,7 +438,7 @@ def residual(x: Union[np.ndarray, Sequence[float]], ar: np.ndarray) -> np.ndarra
 # Fit a single AR model and return residuals/features
 def sar(
     ts_obj: ts,
-    ic: Union[str, bool] = True,
+    ic: str = "AIC",
     order_max: Optional[int] = None,
     **kwargs: Any,
 ) -> Rist:
@@ -458,8 +447,8 @@ def sar(
 
     Args:
         ts_obj (ts): Input time series object.
-        ic (str or bool, optional): Information criterion to select model order.
-            One of 'AIC', 'BIC', 'FPE', or True/False for default behavior. Defaults to True.
+        ic (str, optional): Information criterion to select model order.
+            One of 'AIC', 'BIC', 'FPE', 'AICc', 'KIC', 'AKICc'. Defaults to 'AIC'.
         order_max (int, optional): Maximum AR order to consider. If None, determined automatically.
         **kwargs: Additional arguments passed to `burgar()` (e.g., demean, var_method).
 
@@ -975,6 +964,7 @@ def seqarima(
     fu: Optional[float] = None,
     ar_collector: str = "median",
     ma_collector: str = "median",
+    ar_aic: str = "AIC",
     verbose: bool = True,
 ) -> ts:
     """
@@ -1012,7 +1002,7 @@ def seqarima(
     if p is not None:
         message_verb(f"> (2) Autoregressive stage", verb=verbose)
         out = Autoregressive(
-            out, p=p, ic=True, verbose=verbose, ar_collector=ar_collector
+            out, p=p, ic=ar_aic, verbose=verbose, ar_collector=ar_collector
         )
 
     # Step 3: Moving Average

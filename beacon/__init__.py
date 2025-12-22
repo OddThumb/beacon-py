@@ -6,7 +6,6 @@ from . import DQ
 from . import seqARIMA
 from . import IO
 from . import Calc
-from . import QT
 from . import etc
 from .etc import Rist
 from .etc import summary
@@ -22,7 +21,6 @@ __all__ = [
     "seqARIMA", 
     "IO", 
     "Calc", 
-    "QT", 
     "etc", 
     "Rist", 
     "summary", 

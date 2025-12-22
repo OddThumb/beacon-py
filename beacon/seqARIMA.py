@@ -427,8 +427,8 @@ def residual(x: Union[np.ndarray, Sequence[float]], ar: np.ndarray) -> np.ndarra
     order = len(ar)
 
     # Faster than embed-based calculation of residual
-    # Causal convolution
-    resid = np.convolve(x, a, mode="same")
+    # Causal convolution (one-sided filter, like R's stats::filter with sides=1)
+    resid = np.convolve(x, a, mode="full")[:len(x)]
     # Set first `order` values to NaN (edge effect)
     resid[:order] = np.nan
 
@@ -590,7 +590,7 @@ def ear(
 def Autoregressive(
     ts_obj: ts,
     p: Union[int, Sequence[int]],
-    ic: Union[str, bool] = True,
+    ic: str = "AIC",
     verbose: bool = True,
     ar_collector: str = "median",
     **kwargs: Any,

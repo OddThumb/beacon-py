@@ -412,11 +412,15 @@ class ts:
 
         # Create PyCBC TimeSeries
         # epoch is the GPS time of the first sample
+        if self.start is not None:
+            import lal
+
+            epoch = lal.LIGOTimeGPS(float(self.start))
+        else:
+            epoch = None
+
         return PyCBCTimeSeries(
-            initial_array=self.data,
-            delta_t=delta_t,
-            epoch=self.start,
-            copy=True
+            initial_array=self.data, delta_t=delta_t, epoch=epoch, copy=True
         )
 
     @classmethod
@@ -496,9 +500,7 @@ class ts:
         # Create GWpy TimeSeries
         # t0 is the GPS start time, sample_rate is in Hz
         return GWpyTimeSeries(
-            data=self.data,
-            t0=self.start,
-            sample_rate=self.sampling_freq
+            data=self.data, t0=self.start, sample_rate=self.sampling_freq
         )
 
     @classmethod
@@ -1082,8 +1084,16 @@ def tsref(data, ref=None, start=None, sampling_freq=None, deltat=None):
         ) from e
 
 
-def interpolate_ts(times, data, sampling_freq=None, deltat=None,
-                   t_start=None, t_end=None, kind='linear', fill_value=0.0):
+def interpolate_ts(
+    times,
+    data,
+    sampling_freq=None,
+    deltat=None,
+    t_start=None,
+    t_end=None,
+    kind="linear",
+    fill_value=0.0,
+):
     """
     Interpolate irregularly sampled data to a regularly sampled ts object.
 
@@ -1194,7 +1204,7 @@ def interpolate_ts(times, data, sampling_freq=None, deltat=None,
         kind=kind,
         bounds_error=False,
         fill_value=fill_value,
-        assume_sorted=True
+        assume_sorted=True,
     )
 
     # Interpolate to regular grid

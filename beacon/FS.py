@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 from typing import Optional, Union
 from .TS import *
+from pycbc.psd import welch, interpolate, inverse_spectrum_truncation
 
 
 # Frequency Series class
@@ -247,3 +248,148 @@ def to_fs(ts_obj: ts, delta_f: Optional[float] = None) -> fs:
     inherit_ts_attrs(ts_obj, fs_obj)
 
     return fs_obj
+
+
+# Calculate Welch PSD
+def psd(x, seg_len=None, fl=15.0, delta_f=None, window="hann", avg_method="median"):
+    """
+    Generate power spectral density (PSD) estimate using Welch's method.
+
+    This function mimics the PSD estimation behavior of the R package version,
+    using PyCBC's built-in modules for Welch estimation, interpolation, and
+    inverse spectrum truncation.
+
+    The core estimation pipeline:
+    1. Welch PSD estimation using pycbc.psd.welch() with median averaging
+    2. Interpolation to uniform frequency resolution via pycbc.psd.interpolate()
+    3. Inverse-spectrum truncation using pycbc.psd.inverse_spectrum_truncation()
+       to filter low-frequency components below fl
+
+    Args:
+        x (ts): Time series object.
+        seg_len (float, optional): Segment length for Welch method in seconds.
+            Defaults to duration / 4.
+        fl (float): Low-frequency cutoff for inverse spectrum truncation in Hz.
+            Default: 15.0 Hz.
+        delta_f (float, optional): Frequency resolution in Hz.
+            Defaults to sampling_freq / len(x).
+        window (str): Window function name. Options: 'hann', 'hamming', etc.
+            Default: 'hann'.
+        avg_method (str): Averaging method. Options: 'mean', 'median', 'median-mean'.
+            Default: 'median' (robust to outliers).
+
+    Returns:
+        fs: Frequency series object containing the estimated PSD.
+
+    Examples:
+        >>> x = ts(data, start=0, sampling_freq=4096)
+        >>> psd_est = psd(x, seg_len=1.0, fl=15.0)  # 1 second segments
+        >>> psd_est.plot(logf=True, logy=True)
+
+    References:
+        - PyCBC welch(): https://pycbc.org/pycbc/latest/html/pycbc.psd.html
+        - Welch (1967), The use of fast Fourier transform for the estimation
+          of power spectra: A method based on time averaging over short,
+          modified periodograms.
+    """
+    if not isinstance(x, ts):
+        raise TypeError("Input must be a ts object")
+
+    # Default parameters
+    if seg_len is None:
+        # Default to 1/4 of total duration
+        seg_len_samples = len(x.data) // 4
+    else:
+        # Convert seconds to samples
+        seg_len_samples = int(seg_len * x.sampling_freq)
+
+    if delta_f is None:
+        delta_f = x.sampling_freq / len(x.data)
+
+    # Convert ts to PyCBC TimeSeries
+    pycbc_ts = x.to_pycbc()
+
+    # Step 1: Welch PSD estimation
+    # pycbc.psd.welch returns a FrequencySeries
+    psd_welch = welch(
+        pycbc_ts,
+        seg_len=seg_len_samples,
+        seg_stride=seg_len_samples // 2,  # 50% overlap (standard)
+        window=window,
+        avg_method=avg_method,
+    )
+
+    # Step 2: Interpolate PSD to desired frequency resolution
+    psd_interp = interpolate(psd_welch, delta_f)
+
+    # Step 3: Inverse spectrum truncation
+    # This smooths the PSD and removes low-frequency artifacts
+    psd_final = inverse_spectrum_truncation(
+        psd_interp,
+        max_filter_len=seg_len_samples,
+        low_frequency_cutoff=fl,
+        trunc_method="hann",
+    )
+
+    # Convert PyCBC FrequencySeries back to beacon fs object
+    # PyCBC FrequencySeries stores PSD values (real-valued)
+    result_fs = fs(
+        psd_final.data.astype(np.complex128),  # Convert to complex for fs format
+        delta_f=float(psd_final.delta_f),
+        flen=len(psd_final),
+        tlen=len(x.data),
+        sampling_freq=x.sampling_freq,
+        start=x.start,
+    )
+
+    # Mark this as a PSD object (for plotting purposes)
+    result_fs.is_psd = True
+
+    return result_fs.real
+
+
+def periodogram(x, delta_f=None):
+    """
+    Calculate single-segment periodogram (non-averaged PSD estimate).
+
+    Args:
+        x (ts): Time series object.
+        delta_f (float, optional): Frequency resolution.
+
+    Returns:
+        fs: Frequency series containing the periodogram.
+    """
+    if delta_f is None:
+        delta_f = x.sampling_freq / len(x.data)
+
+    # Use Welch with single segment (no averaging)
+    return psd(x, seg_len=x.duration, delta_f=delta_f, avg_method="mean")
+
+
+def asd(x, **kwargs):
+    """
+    Calculate amplitude spectral density (ASD = sqrt(PSD)).
+
+    Args:
+        x (ts): Time series object.
+        **kwargs: Arguments passed to psd().
+
+    Returns:
+        fs: Frequency series containing the ASD.
+    """
+    psd_result = psd(x, **kwargs)
+
+    # ASD = sqrt(PSD)
+    asd_data = np.sqrt(np.abs(psd_result))
+
+    result_fs = fs(
+        asd_data.astype(np.complex128),
+        delta_f=psd_result.delta_f,
+        flen=psd_result.flen,
+        tlen=psd_result.tlen,
+        sampling_freq=psd_result.sampling_freq,
+        start=psd_result.start,
+    )
+    result_fs.is_asd = True
+
+    return result_fs

@@ -157,7 +157,7 @@ def plot_freq(
     """
     # Get frequency axis and data
     freqs = fs_obj.freqs()
-    data = fs_obj.data
+    data = fs_obj
 
     # Apply frequency range mask if specified
     if frange is not None:
@@ -194,7 +194,14 @@ def plot_freq(
 
     # Labels
     ax.set_xlabel("Frequency (Hz)")
-    ax.set_ylabel("Amplitude")
+
+    # Check if this is a PSD/ASD and set appropriate y-label
+    if hasattr(fs_obj, "is_psd") and fs_obj.is_psd:
+        ax.set_ylabel("PSD (1/Hz)")
+    elif hasattr(fs_obj, "is_asd") and fs_obj.is_asd:
+        ax.set_ylabel(r"ASD (1/$\sqrt{Hz}$)")
+    else:
+        ax.set_ylabel("Amplitude")
 
     if title:
         ax.set_title(title)

@@ -200,6 +200,7 @@ def Differencing(
     ts_obj: ts,
     d: Union[int, str],
     t_seg: float = 0.5,
+    d_max: int = 2, 
     return_pvals: bool = False,
     verbose: bool = True,
 ) -> ts:
@@ -222,7 +223,7 @@ def Differencing(
 
     if d == "auto":
         # KPSS-based auto differencing
-        diff_res = auto_diff(ts_obj, t_seg=t_seg, verbose=verbose)
+        diff_res = auto_diff(ts_obj, t_seg=t_seg, d_max=d_max, verbose=verbose)
         message_verb(f"|> d={diff_res['d']} selected!", verb=verbose)
         diff_ts = diff_res.out
         d_order = diff_res.d
@@ -1048,6 +1049,8 @@ def seqarima(
     q: Union[int, Sequence[int], None] = None,
     fl: Optional[float] = None,
     fu: Optional[float] = None,
+    diff_max: int = 2,
+    diff_tseg: float = 0.5,
     ar_collector: str = "mean",
     ma_collector: str = "mean",
     ar_ic: str = "AIC",
@@ -1079,14 +1082,14 @@ def seqarima(
     # Step 1: Differencing (optional)
     if d is not None:
         message_verb("> (1) Difference stage", verb=verbose)
-        out = Differencing(out, d=d, verbose=verbose)
+        out = Differencing(out, d=d, t_seg=diff_tseg, d_max=diff_max, verbose=verbose)
 
     # Step 2: Autoregressive (required)
     message_verb("> (2) Autoregressive stage", verb=verbose)
     out = Autoregressive(out, p=p, ic=ar_ic, verbose=verbose, ar_collector=ar_collector)
 
     # Step 3: Moving Average (optional)
-    if q is not None:
+    if q: #q is not None:
         message_verb("> (3) Moving-average stage", verbose)
         out = MovingAverage(out, q=q, verbose=verbose, collector=ma_collector)
 

@@ -568,8 +568,10 @@ def config_pipe(replace: Optional[Rist] = None, show_config: bool = True) -> Ris
 
     # Default options
     t_batch = 1
+    f_sampl = 4096.0
     conf = Rist(
         tbch=t_batch,
+        sampling_freq=f_sampl,
         arch=arch,
         DQ="BURST_CAT2",
         # seqARIMA
@@ -579,12 +581,12 @@ def config_pipe(replace: Optional[Rist] = None, show_config: bool = True) -> Ris
         fl=32,
         fu=512,
         # Anomaly Detection
-        nmax=100 * t_batch,
+        nmax=int(f_sampl * t_batch),
         scale=1.5,
         method="iqr",
         decomp=None,
         # Clustering
-        eps=1 / 4096.0,
+        eps=1 / f_sampl,
         # Coincidence
         window_size=128,
         overlap=0.0,
@@ -599,7 +601,10 @@ def config_pipe(replace: Optional[Rist] = None, show_config: bool = True) -> Ris
             raise TypeError("replace must be a Rist.")
 
         if "tbch" in replace.names:
-            conf["nmax"] = 100 * replace["tbch"]
+            t_batch = replace["tbch"]
+        if "sampling_freq" in replace.names:
+            f_sampl = replace["sampling_freq"]
+        conf["nmax"] = int(f_sampl * t_batch)
 
         for name in replace.names:
             conf[name] = replace[name]
@@ -614,28 +619,37 @@ def config_pipe(replace: Optional[Rist] = None, show_config: bool = True) -> Ris
     return conf
 
 
-def print_config(config: Rist) -> None:
+def _format_config(config: Rist) -> str:
     """
-    Print a formatted summary of pipeline configuration parameters.
+    Build a formatted string summary of pipeline configuration parameters.
 
     Args:
         config (Rist): Configuration Rist returned by config_pipe().
+
+    Returns:
+        str: Multi-line formatted configuration summary.
     """
-    print("=" * 60)
-    print("BEACON  CONFIGURATION SUMMARY")
-    print("=" * 60)
+    lines = []
+    lines.append("=" * 60)
+    lines.append("BEACON  CONFIGURATION SUMMARY")
+    lines.append("=" * 60)
+
+    # Input Data
+    lines.append("\n[Input Data]")
+    lines.append(f"  Batch Duration    : {config['tbch']} s")
+    lines.append(f"  Sampling Frequency: {config['sampling_freq']} Hz")
 
     # Pipeline Architecture & Data Quality
-    print("\n[Pipeline Architecture]")
+    lines.append("\n[Pipeline Architecture]")
     arch_func = config["arch"]
     arch_name = arch_func.__name__ if callable(arch_func) else str(arch_func)
-    print(f"  Processing routine: {arch_name}()")
-    print(f"  Data Quality (DQ) : {config['DQ']}")
+    lines.append(f"  Processing routine: {arch_name}()")
+    lines.append(f"  Data Quality (DQ) : {config['DQ']}")
 
     # seqARIMA Parameters
-    print("\n[Sequential ARIMA]")
-    print(f"  Differencing (d)  : {config['d']}")
-    print(f"  AR order (p)      : {config['p']}")
+    lines.append("\n[Sequential ARIMA]")
+    lines.append(f"  Differencing (d)  : {config['d']}")
+    lines.append(f"  AR order (p)      : {config['p']}")
     q_range = config["q"]
     if hasattr(q_range, "__iter__") and not isinstance(q_range, str):
         try:
@@ -644,42 +658,63 @@ def print_config(config: Rist) -> None:
             q_str = str(list(q_range))
     else:
         q_str = str(q_range)
-    print(f"  MA orders (q)     : {q_str}")
-    print(f"  Low freq (fl)     : {config['fl']} Hz")
-    print(f"  High freq (fu)    : {config['fu']} Hz")
+    lines.append(f"  MA orders (q)     : {q_str}")
+    lines.append(f"  Low freq (fl)     : {config['fl']} Hz")
+    lines.append(f"  High freq (fu)    : {config['fu']} Hz")
 
     # Computed overlap from ARIMA
     n_missed = config["n_missed"]
-    print(f"  Head loss (Mh)    : {n_missed[0]} samples")
-    print(f"  Tail loss (Mt)    : {n_missed[1]} samples")
+    lines.append(f"  Head loss (Mh)    : {n_missed[0]} samples")
+    lines.append(f"  Tail loss (Mt)    : {n_missed[1]} samples")
 
     # Anomaly Detection
-    print("\n[Anomaly Detection]")
-    print(f"  Max anomalies     : {config['nmax']}")
-    print(f"  IQR scale         : {config['scale']}")
-    print(f"  Method            : {config['method']}")
-    print(f"  Decomposition     : {config['decomp']}")
+    lines.append("\n[Anomaly Detection]")
+    lines.append(f"  Max anomalies     : {config['nmax']}")
+    lines.append(f"  IQR scale         : {config['scale']}")
+    lines.append(f"  Method            : {config['method']}")
+    lines.append(f"  Decomposition     : {config['decomp']}")
 
     # Clustering
-    print("\n[Clustering (DBSCAN)]")
+    lines.append("\n[Clustering (DBSCAN)]")
     eps_sec = config["eps"]
-    print(
-        f"  Epsilon (eps)     : {eps_sec:.6f} sec ({eps_sec * 4096:.2f} samples @ 4096 Hz)"
+    sampling_freq = config["sampling_freq"]
+    lines.append(
+        f"  Epsilon (eps)     : {eps_sec:.6f} sec ({eps_sec * sampling_freq:.2f} samples @ {sampling_freq} Hz)"
     )
 
     # Coincidence Analysis
-    print("\n[Coincidence Analysis]")
-    print(f"  Window size       : {config['window_size']} samples")
-    print(f"  Overlap           : {config['overlap'] * 100:.1f}%")
+    lines.append("\n[Coincidence Analysis]")
+    lines.append(
+        f"  Window size       : {config['window_size']} samples (± {config['window_size'] / 2 / config['sampling_freq'] * 1000} ms)"
+    )
+    lines.append(f"  Overlap           : {config['overlap'] * 100:.1f}%")
     mean_func = config["mean_func"]
     mean_func_name = mean_func.__name__ if callable(mean_func) else str(mean_func)
-    print(f"  Mean function     : {mean_func_name}")
+    lines.append(f"  Mean function     : {mean_func_name}")
 
     # Statistical Thresholds
-    print("\n[Statistical Parameters]")
-    print(f"  Lambda update P   : {config['P_update']}")
+    lines.append("\n[Statistical Parameters]")
+    lines.append(f"  Lambda update P   : {config['P_update']}")
 
-    print("=" * 60)
+    lines.append("=" * 60)
+    return "\n".join(lines)
+
+
+def print_config(config: Rist, save_path: Optional[str] = None) -> None:
+    """
+    Print a formatted summary of pipeline configuration parameters,
+    and optionally save the same content to a text file.
+
+    Args:
+        config (Rist): Configuration Rist returned by config_pipe().
+        save_path (str, optional): File path to save the summary. If None, only prints.
+    """
+    text = _format_config(config)
+    print(text)
+
+    if save_path is not None:
+        with open(save_path, "w") as f:
+            f.write(text + "\n")
 
 
 def init_pipe(dets: List[str] = ["H1", "L1"]):

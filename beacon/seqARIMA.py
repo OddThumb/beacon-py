@@ -44,6 +44,9 @@ def zero_phasing(data: np.ndarray, coef: np.ndarray) -> np.ndarray:
     """
     Apply zero-phase correction to filtered data.
 
+    Uses odd extension (same as scipy.signal.filtfilt) to maintain
+    continuous first derivative at boundaries, avoiding edge artifacts.
+
     Args:
         data (np.ndarray): Filtered data without NaN values.
         coef (np.ndarray): Filter coefficients.
@@ -55,11 +58,14 @@ def zero_phasing(data: np.ndarray, coef: np.ndarray) -> np.ndarray:
     coef = np.asarray(coef, dtype=np.float64)
     n = len(data)
 
-    # Edge padding to reduce boundary discontinuity
-    pad_length = min(len(coef) * 10, n // 4)
+    # Odd extension padding (filtfilt method) - preserves slope continuity
+    pad_length = min(len(coef) * 10, n - 1)
 
-    # Reflect padding (mirror at edges)
-    data_padded = np.pad(data, pad_length, mode="reflect")
+    # Front: 2*data[0] - data[pad_length:0:-1] (odd reflection about first point)
+    # Back: 2*data[-1] - data[-2:-pad_length-2:-1] (odd reflection about last point)
+    front_pad = 2 * data[0] - data[pad_length:0:-1]
+    back_pad = 2 * data[-1] - data[-2:-pad_length-2:-1]
+    data_padded = np.concatenate([front_pad, data, back_pad])
     n_padded = len(data_padded)
 
     # Phase response of filter
@@ -72,7 +78,7 @@ def zero_phasing(data: np.ndarray, coef: np.ndarray) -> np.ndarray:
     out_padded = np.real(np.fft.ifft(X_corrected))
 
     # Remove padding
-    return out_padded[pad_length : pad_length + n]
+    return out_padded[pad_length:pad_length + n]
 
 
 # ________________________________________________________________

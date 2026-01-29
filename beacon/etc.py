@@ -420,7 +420,6 @@ class Rist:
             "_name_to_index": self._name_to_index,
         }
     
-    
     def __setstate__(self, state):
         """
         For recovery from serialize in pickle
@@ -428,3 +427,17 @@ class Rist:
         self.values = state["values"]
         self.names = state["names"]
         self._name_to_index = state["_name_to_index"]
+    
+    def save(self, path: str) -> None:
+        """Save Rist object to file using pickle."""
+        import pickle
+        with open(path, "wb") as f:
+            pickle.dump(self, f)
+    
+    @classmethod
+    def load(cls, path: str) -> "Rist":
+        """Load Rist object from file."""
+        import pickle
+        with open(path, "rb") as f:
+            return pickle.load(f)
+

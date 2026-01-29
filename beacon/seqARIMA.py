@@ -50,6 +50,13 @@ def zero_phasing(data: np.ndarray, coef: np.ndarray) -> np.ndarray:
     This cancels the phase shift introduced by the filter while
     preserving the magnitude response |A(z)|.
 
+    To avoid edge artifacts from FFT's circular convolution assumption,
+    we use odd-symmetric padding (antisymmetric extension) before FFT
+    and trim after IFFT. This approach:
+    - Eliminates discontinuity at boundaries (signal and derivative continuous)
+    - Does not affect the magnitude response (unlike filtfilt which squares it)
+    - Only corrects the phase response
+
     Args:
         data (np.ndarray): Filtered data (e.g., AR residuals).
         coef (np.ndarray): Filter coefficients [1, -a_1, -a_2, ..., -a_p].
@@ -63,15 +70,35 @@ def zero_phasing(data: np.ndarray, coef: np.ndarray) -> np.ndarray:
     coef = np.asarray(coef, dtype=np.float64)
     n = len(data)
 
+    # Padding length: use filter order or minimum of 64 samples
+    # to ensure smooth boundary extension
+    pad_len = max(len(coef) * 4, 64)
+    pad_len = min(pad_len, n - 1)  # Cannot pad more than data length
+
+    # Odd-symmetric (antisymmetric) extension at both ends
+    # This creates continuity in both value and first derivative
+    # at the boundary, minimizing spectral leakage
+    #
+    # For left padding: reflect data[1:pad_len+1] and negate around data[0]
+    # For right padding: reflect data[-(pad_len+1):-1] and negate around data[-1]
+    left_pad = 2 * data[0] - data[1:pad_len+1][::-1]
+    right_pad = 2 * data[-1] - data[-(pad_len+1):-1][::-1]
+
+    data_padded = np.concatenate([left_pad, data, right_pad])
+    n_padded = len(data_padded)
+
     # Phase response of A(z): φ = arg(A(z))
-    H_f = fft(coef, n=n)
+    H_f = fft(coef, n=n_padded)
     phase = np.angle(H_f)
 
     # Apply phase correction: Y'(z) = Y(z) * e^{-iφ}
-    X_f = fft(data, n=n)
+    X_f = fft(data_padded, n=n_padded)
     X_corrected = X_f * np.exp(-1j * phase)
 
-    return np.real(ifft(X_corrected))
+    result_padded = np.real(ifft(X_corrected))
+
+    # Trim padding and return original length
+    return result_padded[pad_len:pad_len + n]
 
 
 # ________________________________________________________________

@@ -574,6 +574,7 @@ def config_pipe(replace: Optional[Rist] = None, show_config: bool = True) -> Ris
         sampling_freq=f_sampl,
         arch=arch,
         DQ="BURST_CAT2",
+        n_workers=None, # Defulat is None, this will be handled inside pipe_net()
         # seqARIMA
         d=2,
         p=1024,
@@ -629,6 +630,11 @@ def _format_config(config: Rist) -> str:
     Returns:
         str: Multi-line formatted configuration summary.
     """
+    if config['n_worker'] is None:
+        n_worker = "number of detector"
+    else:
+        n_worker = {config["n_worker"]}
+        
     lines = []
     lines.append("=" * 60)
     lines.append("BEACON  CONFIGURATION SUMMARY")
@@ -645,6 +651,7 @@ def _format_config(config: Rist) -> str:
     arch_name = arch_func.__name__ if callable(arch_func) else str(arch_func)
     lines.append(f"  Processing routine: {arch_name}()")
     lines.append(f"  Data Quality (DQ) : {config['DQ']}")
+    lines.append(f"  Number of Workers : {n_worker}")
 
     # seqARIMA Parameters
     lines.append("\n[Sequential ARIMA]")
@@ -1402,6 +1409,7 @@ def pipe_net(
     coinc_lis: Rist,
     arch_params: Rist,
     use_thread: bool = True,
+    max_workers: Optional[int] = None,
     verbose: bool = True,
 ) -> tuple[Rist, Rist, Rist]:
     """
@@ -1433,7 +1441,12 @@ def pipe_net(
         )
 
     if use_thread:
-        with ThreadPoolExecutor() as executor:
+        max_workers = arch_params.n_workers
+        if max_workers is None:
+            # If `n_workers` (`max_workers`` here) is not given (given as None (default)), number of detector will be used.
+            max_workers = len(dets) 
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             res_list = list(executor.map(run_pipe, dets))
     else:
         res_list = [run_pipe(det) for det in dets]
@@ -1518,7 +1531,7 @@ def stream(batch_set: Rist, arch_params: Rist, use_model: Rist = None) -> Rist:
             prev_batch=prev_batch,
             res_net=res_net,
             coinc_lis=coinc_lis,
-            arch_params=arch_params,
+            arch_params=arch_params
         )
 
         eta_lis.append(time.time() - start)

@@ -68,8 +68,9 @@ def zero_phasing(data: np.ndarray, coef: np.ndarray) -> np.ndarray:
     pad_length = min(max(n_coef * 3, 512), n // 2)
 
     # Odd extension (filtfilt method) - preserves slope continuity at boundaries
-    front_pad = 2 * data[0] - data[pad_length:0:-1]
-    back_pad = 2 * data[-1] - data[-2:-pad_length-2:-1]
+    # Using np.flip for clearer and symmetric indexing
+    front_pad = 2 * data[0] - np.flip(data[1:pad_length + 1])
+    back_pad = 2 * data[-1] - np.flip(data[-pad_length - 1:-1])
     data_padded = np.concatenate([front_pad, data, back_pad])
 
     # Use optimal FFT length with extra zero-padding to reduce circular effects

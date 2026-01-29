@@ -57,36 +57,21 @@ def zero_phasing(data: np.ndarray, coef: np.ndarray) -> np.ndarray:
     Returns:
         np.ndarray: Phase-corrected data with same length as input.
     """
-    from scipy.fft import fft, ifft, next_fast_len
+    from scipy.fft import fft, ifft
 
     data = np.asarray(data, dtype=np.float64)
     coef = np.asarray(coef, dtype=np.float64)
     n = len(data)
-    n_coef = len(coef)
-
-    # Sufficient padding: at least 3x filter length, up to half of data length
-    pad_length = min(max(n_coef * 3, 512), n // 2)
-
-    # Odd extension (filtfilt method) - preserves slope continuity at boundaries
-    # Using np.flip for clearer and symmetric indexing
-    front_pad = 2 * data[0] - np.flip(data[1:pad_length + 1])
-    back_pad = 2 * data[-1] - np.flip(data[-pad_length - 1:-1])
-    data_padded = np.concatenate([front_pad, data, back_pad])
-
-    # Use optimal FFT length with extra zero-padding to reduce circular effects
-    n_fft = next_fast_len(len(data_padded) + n_coef)
 
     # Phase response of A(z): φ = arg(A(z))
-    H_f = fft(coef, n=n_fft)
+    H_f = fft(coef, n=n)
     phase = np.angle(H_f)
 
     # Apply phase correction: Y'(z) = Y(z) * e^{-iφ}
-    X_f = fft(data_padded, n=n_fft)
+    X_f = fft(data, n=n)
     X_corrected = X_f * np.exp(-1j * phase)
-    out_full = np.real(ifft(X_corrected))
 
-    # Extract original data region
-    return out_full[pad_length:pad_length + n]
+    return np.real(ifft(X_corrected))
 
 
 # ________________________________________________________________

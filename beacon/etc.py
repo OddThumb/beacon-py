@@ -409,3 +409,22 @@ class Rist:
                 val.copy() if isinstance(val, Rist) else val for val in self.values
             ]
             return Rist(*unnamed)
+        
+    def __getstate__(self):
+        """
+        For serialize in pickle
+        """
+        return {
+            "values": self.values,
+            "names": self.names,
+            "_name_to_index": self._name_to_index,
+        }
+    
+    
+    def __setstate__(self, state):
+        """
+        For recovery from serialize in pickle
+        """
+        self.values = state["values"]
+        self.names = state["names"]
+        self._name_to_index = state["_name_to_index"]

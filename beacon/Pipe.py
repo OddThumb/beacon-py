@@ -1443,13 +1443,14 @@ def pipe_net(
         max_workers = arch_params.n_workers
         if max_workers is None:
             max_workers = len(dets)
-
-        res_list = Parallel(n_jobs=max_workers)(
-            delayed(_run_pipe_worker)(
-                det, batch_net, prev_batch, res_list_map,   arch_params, verbose
+    
+        with parallel_backend('loky', inner_max_num_threads=1):
+            res_list = Parallel(n_jobs=max_workers)(
+                delayed(_run_pipe_worker)(
+                    det, batch_net, prev_batch, res_list_map,   arch_params, verbose
+                )
+                for det in dets
             )
-            for det in dets
-        )
     else:
         res_list = [
             _run_pipe_worker(det, batch_net, prev_batch,    res_list_map, arch_params, verbose)

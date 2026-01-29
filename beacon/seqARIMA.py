@@ -44,41 +44,48 @@ def zero_phasing(data: np.ndarray, coef: np.ndarray) -> np.ndarray:
     """
     Apply zero-phase correction to filtered data.
 
-    Uses odd extension (same as scipy.signal.filtfilt) to maintain
-    continuous first derivative at boundaries, avoiding edge artifacts.
+    Corrects phase distortion from causal filters (diff, AR) by:
+        Y'(z) = Y(z) * e^{-iφ}  where φ = arg(A(z))
+
+    This cancels the phase shift introduced by the filter while
+    preserving the magnitude response |A(z)|.
 
     Args:
-        data (np.ndarray): Filtered data without NaN values.
-        coef (np.ndarray): Filter coefficients.
+        data (np.ndarray): Filtered data (e.g., AR residuals).
+        coef (np.ndarray): Filter coefficients [1, -a_1, -a_2, ..., -a_p].
 
     Returns:
         np.ndarray: Phase-corrected data with same length as input.
     """
+    from scipy.fft import fft, ifft, next_fast_len
+
     data = np.asarray(data, dtype=np.float64)
     coef = np.asarray(coef, dtype=np.float64)
     n = len(data)
+    n_coef = len(coef)
 
-    # Odd extension padding (filtfilt method) - preserves slope continuity
-    pad_length = min(len(coef) * 10, n - 1)
+    # Sufficient padding: at least 3x filter length, up to half of data length
+    pad_length = min(max(n_coef * 3, 512), n // 2)
 
-    # Front: 2*data[0] - data[pad_length:0:-1] (odd reflection about first point)
-    # Back: 2*data[-1] - data[-2:-pad_length-2:-1] (odd reflection about last point)
+    # Odd extension (filtfilt method) - preserves slope continuity at boundaries
     front_pad = 2 * data[0] - data[pad_length:0:-1]
     back_pad = 2 * data[-1] - data[-2:-pad_length-2:-1]
     data_padded = np.concatenate([front_pad, data, back_pad])
-    n_padded = len(data_padded)
 
-    # Phase response of filter
-    H_f = np.fft.fft(np.r_[coef, np.zeros(n_padded - len(coef))])
+    # Use optimal FFT length with extra zero-padding to reduce circular effects
+    n_fft = next_fast_len(len(data_padded) + n_coef)
+
+    # Phase response of A(z): φ = arg(A(z))
+    H_f = fft(coef, n=n_fft)
     phase = np.angle(H_f)
 
-    # Phase correction
-    X_f = np.fft.fft(data_padded)
+    # Apply phase correction: Y'(z) = Y(z) * e^{-iφ}
+    X_f = fft(data_padded, n=n_fft)
     X_corrected = X_f * np.exp(-1j * phase)
-    out_padded = np.real(np.fft.ifft(X_corrected))
+    out_full = np.real(ifft(X_corrected))
 
-    # Remove padding
-    return out_padded[pad_length:pad_length + n]
+    # Extract original data region
+    return out_full[pad_length:pad_length + n]
 
 
 # ________________________________________________________________

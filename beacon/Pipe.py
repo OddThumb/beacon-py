@@ -18,7 +18,7 @@ from sklearn.cluster import DBSCAN
 from scipy.stats import poisson
 
 # For pipe_net in running parallel
-from joblib import Parallel, delayed
+from joblib import Parallel, delayed, parallel_backend
 #from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
 # For measuring pipe_net() per each batch inside stream()
@@ -1443,7 +1443,7 @@ def pipe_net(
         max_workers = arch_params.n_workers
         if max_workers is None:
             max_workers = len(dets)
-    
+
         with parallel_backend('loky', inner_max_num_threads=1):
             res_list = Parallel(n_jobs=max_workers)(
                 delayed(_run_pipe_worker)(

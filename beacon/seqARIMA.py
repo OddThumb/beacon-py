@@ -415,10 +415,11 @@ def burgar(
     var_pred = vars_pred[selected_order]
 
     # Residuals (convolution-based)
+    # Use mode="valid" to avoid boundary effects at both ends
+    # This returns only the region where full overlap exists (length: n - p)
     if selected_order > 0:
         a = np.r_[1.0, -ar]
-        resid = np.convolve(x, a, mode="full")[:n_used]
-        resid[:selected_order] = np.nan
+        resid = np.convolve(x, a, mode="valid")
     else:
         resid = x.copy()
 
@@ -463,11 +464,12 @@ def pred_resid(ts_obj, arcoef):
         ts: AR residual time series.
     """
     data = ts_obj.data
-    n_used = data.size
     p_order = len(arcoef)
     a = np.r_[1.0, -arcoef]
-    resid = np.convolve(data, a, mode="full")[p_order:n_used]
-    
+
+    # Use mode="valid" to avoid boundary effects
+    resid = np.convolve(data, a, mode="valid")
+
     resid_zp = zero_phasing(resid, a)
     new_start = ts_obj.start + p_order / ts_obj.sampling_freq
 

@@ -630,10 +630,10 @@ def _format_config(config: Rist) -> str:
     Returns:
         str: Multi-line formatted configuration summary.
     """
-    if config['n_worker'] is None:
-        n_worker = "number of detector"
+    if config['n_workers'] is None:
+        n_workers = "number of detector"
     else:
-        n_worker = {config["n_worker"]}
+        n_workers = {config["n_workers"]}
         
     lines = []
     lines.append("=" * 60)
@@ -651,7 +651,7 @@ def _format_config(config: Rist) -> str:
     arch_name = arch_func.__name__ if callable(arch_func) else str(arch_func)
     lines.append(f"  Processing routine: {arch_name}()")
     lines.append(f"  Data Quality (DQ) : {config['DQ']}")
-    lines.append(f"  Number of Workers : {n_worker}")
+    lines.append(f"  Number of Workers : {n_workers}")
 
     # seqARIMA Parameters
     lines.append("\n[Sequential ARIMA]")

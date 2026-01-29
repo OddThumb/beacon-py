@@ -1447,13 +1447,13 @@ def pipe_net(
         with parallel_backend('loky', inner_max_num_threads=1):
             res_list = Parallel(n_jobs=max_workers)(
                 delayed(_run_pipe_worker)(
-                    det, batch_net, prev_batch, res_list_map,   arch_params, verbose
+                    det, batch_net, prev_batch, res_list_map, arch_params, verbose
                 )
                 for det in dets
             )
     else:
         res_list = [
-            _run_pipe_worker(det, batch_net, prev_batch,    res_list_map, arch_params, verbose)
+            _run_pipe_worker(det, batch_net, prev_batch, res_list_map, arch_params, verbose)
             for det in dets
         ]
     res_net_updated = Rist(**dict(zip(dets, res_list)))
@@ -1486,7 +1486,7 @@ def pipe_net(
                 p_col=(
                     f"P0_{arch_params['DQ']}" if arch_params["DQ"] is not None else "P0"
                 ),
-                return_mode=2,
+                return_mode=1,
             )
         except Exception as e:
             print(f"  [coincide_P0 error] {e}")

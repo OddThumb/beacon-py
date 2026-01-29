@@ -18,7 +18,8 @@ from sklearn.cluster import DBSCAN
 from scipy.stats import poisson
 
 # For pipe_net in running parallel
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from joblib import Parallel, delayed
+#from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
 # For measuring pipe_net() per each batch inside stream()
 import time
@@ -1401,6 +1402,15 @@ def coincide_P0(
 
         return Rist(joined=joined_trimmed, result=grouped)
 
+def _run_pipe_worker(det, batch_net, prev_batch, res_list_map, arch_params, verbose):
+    """Worker function for parallel pipe execution."""
+    return pipe(
+        curr_batch=batch_net[det],
+        prev_batch=prev_batch[det],
+        res_list=res_list_map[det],
+        arch_params=arch_params,
+        verb=verbose,
+    )
 
 def pipe_net(
     batch_net: Rist,
@@ -1427,29 +1437,24 @@ def pipe_net(
         Tuple[Rist, Rist, Rist]: Updated (res_net, prev_batch, coinc_lis).
     """
     dets = batch_net.names
-
     res_list_map = {det: res_net[det].copy() for det in dets}
-
-    def run_pipe(det):
-        return pipe(
-            curr_batch=batch_net[det],
-            prev_batch=prev_batch[det],
-            res_list=res_list_map[det],
-            arch_params=arch_params,
-            verb=verbose,
-        )
 
     if use_thread:
         max_workers = arch_params.n_workers
         if max_workers is None:
-            # If `n_workers` (`max_workers`` here) is not given (given as None (default)), number of detector will be used.
-            max_workers = len(dets) 
+            max_workers = len(dets)
 
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            res_list = list(executor.map(run_pipe, dets))
+        res_list = Parallel(n_jobs=max_workers)(
+            delayed(_run_pipe_worker)(
+                det, batch_net, prev_batch, res_list_map,   arch_params, verbose
+            )
+            for det in dets
+        )
     else:
-        res_list = [run_pipe(det) for det in dets]
-
+        res_list = [
+            _run_pipe_worker(det, batch_net, prev_batch,    res_list_map, arch_params, verbose)
+            for det in dets
+        ]
     res_net_updated = Rist(**dict(zip(dets, res_list)))
 
     for det in dets:

@@ -18,7 +18,7 @@ from sklearn.cluster import DBSCAN
 from scipy.stats import poisson
 
 # For pipe_net in running parallel
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
 # For measuring pipe_net() per each batch inside stream()
 import time
@@ -1409,7 +1409,6 @@ def pipe_net(
     coinc_lis: Rist,
     arch_params: Rist,
     use_thread: bool = True,
-    max_workers: Optional[int] = None,
     verbose: bool = True,
 ) -> tuple[Rist, Rist, Rist]:
     """
@@ -1446,7 +1445,7 @@ def pipe_net(
             # If `n_workers` (`max_workers`` here) is not given (given as None (default)), number of detector will be used.
             max_workers = len(dets) 
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
             res_list = list(executor.map(run_pipe, dets))
     else:
         res_list = [run_pipe(det) for det in dets]

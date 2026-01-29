@@ -164,6 +164,22 @@ class ts:
     def __dir__(self):
         return list(super().__dir__()) + list(self._dynamic_attrs.keys())
 
+    # For pickle serialization
+    def __getstate__(self):
+        return {
+            "data": self.data,
+            "start": self.start,
+            "sampling_freq": self.sampling_freq,
+            "_dynamic_attrs": self._dynamic_attrs,
+        }
+
+    # For pickle deserialization
+    def __setstate__(self, state):
+        self.data = state["data"]
+        self.start = state["start"]
+        self.sampling_freq = state["sampling_freq"]
+        self._dynamic_attrs = state["_dynamic_attrs"]
+
     @property
     def end(self):
         return self.start + (len(self.data) - 1) / self.sampling_freq

@@ -576,53 +576,51 @@ def plot_anomaly(
 
 
 def plot_lambda(
-    res_net: "Rist",
+    summary: pl.DataFrame,
     lambda_type: Literal["a", "c"] = "a",
-    chunk_len: float = 1.0,
-    t_from: Optional[float] = None,
+    use_batch: Literal["raw", "upd"] = "upd",
     figsize: tuple = (8, 4),
 ) -> None:
     """
-    Plot the update history of lambda_a or lambda_c using res_net (Rist object).
+    Plot the update history of lambda_a or lambda_c from summary DataFrame.
 
     Args:
-        res_net: Rist object containing detector-wise lambda update history.
+        summary: DataFrame with columns: batch_id, detector, lambda_a, lambda_c,
+                 lambda_a_upd, lambda_c_upd. Can be from:
+                 - stream() return: result["summary"]
+                 - checkpoint mode: pl.read_parquet("checkpoint/summary.parquet")
         lambda_type: Either "a" for λ_a or "c" for λ_c.
-        chunk_len: Batch duration to scale time axis.
-        t_from: Optional float to label x-axis origin.
+        use_batch: "raw" for per-batch lambda, "upd" for cumulative updated lambda.
+        figsize: Figure size.
     """
     if lambda_type not in {"a", "c"}:
         raise ValueError("lambda_type must be either 'a' or 'c'")
+    if use_batch not in {"raw", "upd"}:
+        raise ValueError("use_batch must be either 'raw' or 'upd'")
 
-    extract_key = lambda_type
-    y_label = r"$\lambda_a$" if lambda_type == "a" else r"$\lambda_c$"
-    title = (
-        r"Update history of $\lambda_a$"
-        if lambda_type == "a"
-        else r"Update history of $\lambda_c$"
-    )
+    # Select column
+    col = f"lambda_{lambda_type}" if use_batch == "raw" else f"lambda_{lambda_type}_upd"
 
-    df_dict = {}
-    for det in res_net.names:
-        lamb_list = res_net[det].lamb  # This is a Rist of Rist(a=..., c=...)
-        values = [l[extract_key] for l in lamb_list]
-        df_dict[det] = values
+    if col not in summary.columns:
+        raise ValueError(f"Column '{col}' not found in summary DataFrame")
 
-    n_rows = len(next(iter(df_dict.values())))
-    df_dict["tt"] = [chunk_len * (i + 1) for i in range(n_rows)]
-    df = pl.DataFrame(df_dict)
-
-    df_long = df.unpivot(index=["tt"], variable_name="detector", value_name="value")
+    y_label = rf"$\lambda_{lambda_type}$"
+    suffix = "(per batch)" if use_batch == "raw" else "(cumulative)"
+    title = rf"Update history of $\lambda_{lambda_type}$ {suffix}"
 
     fig, ax = plt.subplots(figsize=figsize)
-    for det in df_long["detector"].unique():
-        sub = df_long.filter(pl.col("detector") == det)
-        ax.plot(sub["tt"].to_numpy(), sub["value"].to_numpy(), label=det)
 
-    xlabel = (
-        r"$\mathit{t}~(s)$" if t_from is None else rf"$\mathit{{t}}~(s)$ from {t_from}"
-    )
-    ax.set_xlabel(xlabel)
+    for det in summary["detector"].unique().sort():
+        sub = summary.filter(pl.col("detector") == det).sort("batch_id")
+        ax.plot(
+            sub["batch_id"].to_numpy(),
+            sub[col].to_numpy(),
+            marker="o",
+            markersize=3,
+            label=det,
+        )
+
+    ax.set_xlabel("Batch")
     ax.set_ylabel(y_label)
     ax.set_title(title)
     ax.grid(True, linestyle="--", linewidth=0.5)

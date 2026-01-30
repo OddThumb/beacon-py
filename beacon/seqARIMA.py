@@ -250,15 +250,24 @@ def Differencing(
     else:
         raise ValueError("d must be 'auto', 0, or a positive integer.")
 
-    # Zero-phase correction (only if d > 0)
+    # Zero-phase correction and tail cropping (only if d > 0)
     if d_order > 0:
         coef = diff_coef(d_order)
         diff_zp = zero_phasing(diff_ts.data, coef)
-        out_ts = tsref(diff_zp, diff_ts)
+
+        # Crop tail d samples to remove zero_phasing edge artifact
+        diff_zp_cropped = diff_zp[:-d_order]
+
+        # Create output ts (start unchanged, end shortened by d)
+        out_ts = ts(
+            diff_zp_cropped,
+            start=diff_ts.start,
+            sampling_freq=diff_ts.sampling_freq,
+        )
         meta["diff_coef"] = coef
     else:
         out_ts = diff_ts
-    
+
     # Inherit attributes and attach metadata
     inherit_ts_attrs(ts_obj, out_ts)
     setattr(out_ts, "diff_meta", meta)
@@ -415,11 +424,9 @@ def burgar(
     var_pred = vars_pred[selected_order]
 
     # Residuals (convolution-based)
-    # Use mode="valid" to avoid boundary effects at both ends
-    # This returns only the region where full overlap exists (length: n - p)
     if selected_order > 0:
         a = np.r_[1.0, -ar]
-        resid = np.convolve(x, a, mode="valid")
+        resid = np.convolve(x, a, mode="valid")  # mode="valid" returns only the region where full overlap exists (length: n - p)
     else:
         resid = x.copy()
 

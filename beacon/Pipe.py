@@ -785,10 +785,10 @@ def tr_overlap(d: int, p: int, q: int, split: bool = False) -> Union[int, Rist]:
     max_q = np.max(q)
     if max_q % 2 == 0:
         Mh = max_d + max_p + max_q // 2
-        Mt = max_q // 2
+        Mt = max_d + max_q // 2
     else:
         Mh = max_d + max_p + (max_q - 1) // 2
-        Mt = (max_q - 1) // 2
+        Mt = max_d + (max_q - 1) // 2
 
     if split:
         return Rist(Mh=Mh, Mt=Mt)

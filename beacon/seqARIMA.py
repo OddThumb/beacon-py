@@ -493,8 +493,9 @@ def sar(
 
     Returns:
         Rist: Container with:
-            - resid: Zero-phase residual time series as `ts` object (NA padding removed).
-            - feature: pd.Series of AR coefficients, innovation variance, and input mean.
+            - resid: Zero-phase residual time series as `ts` object.
+            - ar_coef: AR coefficients (np.ndarray).
+            - var_pred: Prediction variance (float).
             - p_order: Selected AR order.
             - ar_collector: Always "single" for SAR.
             - AR_obj: Full AR model result from `burgar()`.
@@ -502,58 +503,44 @@ def sar(
     ar_result = burgar(ts_obj.data, ic=ic, order_max=order_max, **kwargs)
     p = ar_result.order
     resid = ar_result.resid
-    resid_nonan = resid[~np.isnan(resid)]
 
     # Zero-phase correction
     coef = np.r_[1, -ar_result.ar]
-    resid_zp = zero_phasing(resid_nonan, coef)
+    resid_zp = zero_phasing(resid, coef)
     new_start = ts_obj.start + p / ts_obj.sampling_freq
     resid_ts = ts(resid_zp, start=new_start, sampling_freq=ts_obj.sampling_freq)
-    
-    coeff_labels = [f"ar{p}_{i + 1}" for i in range(len(ar_result.ar))]
-    coeff_series = pd.Series(ar_result.ar, index=coeff_labels)
-    extra_series = pd.Series(
-        {f"ar{p}_var": ar_result.var_pred, f"ar{p}_mean": ar_result.x_mean}
-    )
-    feature = pd.concat([coeff_series, extra_series])
 
     return Rist(
         resid=resid_ts,
         ar_coef=ar_result.ar,
         var_pred=ar_result.var_pred,
-        feature=feature,
         p_order=p,
         ar_collector="single",
         AR_obj=ar_result,
     )
 
 
-# Fit ensemble of AR models and return aggregated residuals/features
+# Fit ensemble of AR models and return aggregated residuals
 def ear(
     ts_obj: ts,
     ps: Sequence[int] = (100, 500, 1000),
     ic: Union[str, bool] = True,
     ar_collector: str = "median",
-    return_vec: bool = True,
-    return_var: bool = True,
-    return_mean: bool = True,
 ) -> Rist:
     """
-    Fit multiple AR models (ensemble) and aggregate residuals and features.
+    Fit multiple AR models (ensemble) and aggregate residuals.
 
     Args:
         ts_obj (ts): Input time series object.
         ps (Sequence[int], optional): List of AR orders to fit. Defaults to (100, 500, 1000).
         ic (str or bool, optional): Information criterion for order selection. Defaults to True.
         ar_collector (str, optional): Method to aggregate residuals ('median', 'mean', 'pca'). Defaults to 'median'.
-        return_vec (bool, optional): If True, return single pd.Series; else list of feature dicts.
-        return_var (bool, optional): Include innovation variance in features. Defaults to True.
-        return_mean (bool, optional): Include input mean in features. Defaults to True.
 
     Returns:
         Rist: Container with:
-            - resid: Aggregated residuals as `ts` object (aligned and NA-trimmed).
-            - feature: Aggregated feature vector (pd.Series or list of dicts).
+            - resid: Aggregated residuals as `ts` object.
+            - ar_coef: Rist of AR coefficients keyed by order (e.g., {p100: [...], p500: [...]}).
+            - var_pred: Rist of prediction variances keyed by order.
             - p_order: Selected AR orders.
             - ar_collector: Aggregation method used.
     """
@@ -564,7 +551,7 @@ def ear(
     ar_fits = [ar_fits[i] for i in unique_indices]
     psel = orders[unique_indices]
 
-    resids_list = [fit.resid[fit.order :] for fit in ar_fits]
+    resids_list = [fit.resid for fit in ar_fits]
     min_len = min(map(len, resids_list))
     resid_mat = np.stack([r[-min_len:] for r in resids_list], axis=1)
 
@@ -585,27 +572,14 @@ def ear(
     new_start = ts_obj.start + (len(ts_obj.data) - min_len) / ts_obj.sampling_freq
     resids_ts = ts(resid_ens_core, start=new_start, sampling_freq=ts_obj.sampling_freq)
 
-    feat_list = []
-    for fit in ar_fits:
-        p = fit.order
-        feat = {f"ar{p}_{i+1}": coef for i, coef in enumerate(fit.ar)}
-        if return_var:
-            feat[f"ar{p}_var"] = fit.var_pred
-        if return_mean:
-            feat[f"ar{p}_mean"] = fit.x_mean
-        feat_list.append(feat)
-
-    if return_vec:
-        flat = {}
-        for d in feat_list:
-            flat.update(d)
-        feature_out = pd.Series(flat)
-    else:
-        feature_out = feat_list
+    # Build Rist for ar_coef and var_pred keyed by p order
+    ar_coef_rist = Rist({f"ar{fit.order}": fit.ar for fit in ar_fits})
+    var_pred_rist = Rist({f"ar{fit.order}": fit.var_pred for fit in ar_fits})
 
     return Rist(
         resid=resids_ts,
-        feature=feature_out,
+        ar_coef=ar_coef_rist,
+        var_pred=var_pred_rist,
         p_order=psel,
         ar_collector=ar_collector_name,
     )
@@ -638,7 +612,8 @@ def Autoregressive(
 
     Returns:
         ts: Residuals as a time series (`ts`) object, with `ar_meta` attribute (Rist) containing:
-            - 'feature': Extracted AR coefficients and statistics.
+            - 'ar_coef': AR coefficients (ndarray for SAR, Rist for EAR).
+            - 'var_pred': Prediction variance (float for SAR, Rist for EAR).
             - 'p_order': Selected AR order(s).
             - 'ar_collector': Aggregation strategy used.
     """
@@ -654,15 +629,14 @@ def Autoregressive(
         message_verb(f"|> p={result.p_order} selected!", verb=verbose)
 
     resid = result.resid
-    
+
     # Inherit attributes
     inherit_ts_attrs(ts_obj, resid)
 
-    # Attach features to ts object
+    # Attach metadata to ts object
     meta = Rist(
         ar_coef=result.ar_coef,
         var_pred=result.var_pred,
-        feature=result.feature,
         p_order=result.p_order,
         ar_collector=result.ar_collector,
     )

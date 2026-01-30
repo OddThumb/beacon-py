@@ -284,6 +284,63 @@ class ts:
             f"  Data      = {data_str}\n"
         )
 
+    def crop(self, start=None, end=None):
+        """
+        Extract a subset of the time series by data index.
+
+        Similar to PyCBC's TimeSeries.crop(), but uses integer indices
+        instead of time values. For time-based slicing, use window().
+
+        Args:
+            start (int, optional): Start index (inclusive). Defaults to 0.
+            end (int, optional): End index (exclusive). Defaults to length.
+                Negative indices are supported (e.g., -1 means last element).
+
+        Returns:
+            ts: New time series object containing the cropped data.
+
+        Examples:
+            >>> x = ts([1, 2, 3, 4, 5], start=0, sampling_freq=1)
+            >>> x.crop(1, 4).data  # [2, 3, 4]
+            >>> x.crop(start=2).data  # [3, 4, 5]
+            >>> x.crop(end=-1).data  # [1, 2, 3, 4]
+            >>> x.crop(100, -100).data  # [101st sample to 100th from end]
+        """
+        n = len(self.data)
+
+        # Handle defaults
+        if start is None:
+            start = 0
+        if end is None:
+            end = n
+
+        # Handle negative indices
+        if start < 0:
+            start = n + start
+        if end < 0:
+            end = n + end
+
+        # Clamp to valid range
+        start = max(0, min(start, n))
+        end = max(0, min(end, n))
+
+        if start >= end:
+            raise ValueError(f"Invalid crop range: start={start} >= end={end}")
+
+        # Slice data
+        cropped_data = self.data[start:end]
+
+        # Calculate new start time
+        new_start = self.start + start / self.sampling_freq
+
+        # Create new ts object
+        out = ts(cropped_data, start=new_start, sampling_freq=self.sampling_freq)
+
+        # Inherit attributes
+        inherit_ts_attrs(self, out)
+
+        return out
+
     def window(self, start=None, end=None, extend=False):
         """
         Extract a time window from the series.

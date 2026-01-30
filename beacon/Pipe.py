@@ -7,7 +7,7 @@ from .Calc import *
 from .etc import Rist
 
 # For type annotations
-from typing import Sequence, Optional, Union, List, Callable, Any, cast
+from typing import Sequence, Optional, Union, List, Callable, Any
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -23,6 +23,11 @@ from joblib import Parallel, delayed, parallel_backend
 
 # For measuring pipe_net() per each batch inside stream()
 import time
+import os
+
+# For checkpoint saving
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # Turn off KPSS interpolation warning
 import warnings
@@ -1311,8 +1316,7 @@ def coincide_P0(
     step_size: Optional[int] = None,
     mean_func: Callable[[pl.Series], float] = har_mean,
     p_col: str = "P0",
-    return_mode: int = 1,
-) -> Union[pl.DataFrame, Rist]:
+) -> pl.DataFrame:
     """
     Compute coincident probability (P0) over time-binned windows between two detectors.
 
@@ -1325,14 +1329,15 @@ def coincide_P0(
         step_size (int, optional): Step size between windows. Defaults to (1-overlap) * window_size.
         mean_func (Callable): Aggregation function for each window (default: harmonic mean).
         p_col (str): Column name of per-detector probability.
-        return_mode (int): 1 = result only, 2 = joined + result.
 
     Returns:
-        pl.DataFrame or Rist: Time-binned coincident probability result (and optionally, joined raw data).
+        pl.DataFrame: Time-binned coincident probability result with columns:
+            - bin_id: Bin identifier (1-indexed)
+            - time_bin: Median time of the bin
+            - P0_H1_bin: Aggregated P0 for H1 detector
+            - P0_L1_bin: Aggregated P0 for L1 detector
+            - P0_net: Coincident probability (P0_H1_bin * P0_L1_bin)
     """
-    if return_mode not in (1, 2):
-        raise ValueError("return_mode must be 1 or 2")
-
     if step_size is None:
         step_size = int((1 - overlap) * window_size)
 
@@ -1392,15 +1397,7 @@ def coincide_P0(
         )
     )
 
-    if return_mode == 1:
-        return grouped
-
-    elif return_mode == 2:
-        joined_trimmed = joined_overlap.join(
-            grouped.select(["bin_id", "P0_net"]), on="bin_id", how="left"
-        ).select(["time", "bin_id", "P0_H1", "P0_L1", "P0_net"])
-
-        return Rist(joined=joined_trimmed, result=grouped)
+    return grouped
 
 def _run_pipe_worker(det, batch_net, prev_batch, res_list_map, arch_params, verbose):
     """Worker function for parallel pipe execution."""
@@ -1486,7 +1483,6 @@ def pipe_net(
                 p_col=(
                     f"P0_{arch_params['DQ']}" if arch_params["DQ"] is not None else "P0"
                 ),
-                return_mode=1,
             )
         except Exception as e:
             print(f"  [coincide_P0 error] {e}")
@@ -1498,7 +1494,85 @@ def pipe_net(
 
 
 # Streaming batch data into pipe_net
-def stream(batch_set: Rist, arch_params: Rist, use_model: Rist = None) -> Rist:
+def _get_summary_schema(dets: List[str]) -> pa.Schema:
+    """
+    Define PyArrow schema for summary.parquet.
+
+    Columns: batch_id, detector, t_batch, N_cl, N_anom,
+             lambda_a, lambda_c, lambda_a_upd, lambda_c_upd, eta
+    """
+    return pa.schema([
+        ('batch_id', pa.int32()),
+        ('detector', pa.string()),
+        ('t_batch', pa.float64()),
+        ('N_cl', pa.int32()),
+        ('N_anom', pa.int32()),
+        ('lambda_a', pa.float64()),
+        ('lambda_c', pa.float64()),
+        ('lambda_a_upd', pa.float64()),
+        ('lambda_c_upd', pa.float64()),
+        ('eta', pa.float64()),
+    ])
+
+
+def _build_summary_rows(
+    batch_id: int,
+    dets: List[str],
+    res_net: Rist,
+    eta: float,
+) -> List[dict]:
+    """
+    Build summary rows for current batch (one row per detector).
+    """
+    rows = []
+    for det in dets:
+        # Current batch stat
+        current_stat = res_net[det]["stat"][-1] if len(res_net[det]["stat"]) > 0 else None
+        # Updated (cumulative) lambda
+        current_lamb = res_net[det]["lamb"][-1] if len(res_net[det]["lamb"]) > 0 else None
+
+        if current_stat is not None and not is_all_nan(current_stat):
+            stats = current_stat["stats"]
+            t_batch = stats["t_batch"]
+            N_cl = stats["N_cl"]
+            N_anom = stats["N_anom"]
+            lambda_a = stats["lambda_a"]
+            lambda_c = stats["lambda_c"]
+        else:
+            t_batch = np.nan
+            N_cl = 0
+            N_anom = 0
+            lambda_a = np.nan
+            lambda_c = np.nan
+
+        if current_lamb is not None and not is_all_nan(current_lamb):
+            lambda_a_upd = current_lamb["a"]
+            lambda_c_upd = current_lamb["c"]
+        else:
+            lambda_a_upd = np.nan
+            lambda_c_upd = np.nan
+
+        rows.append({
+            'batch_id': batch_id,
+            'detector': det,
+            't_batch': float(t_batch) if not np.isnan(t_batch) else None,
+            'N_cl': int(N_cl) if N_cl is not None else None,
+            'N_anom': int(N_anom) if N_anom is not None else None,
+            'lambda_a': float(lambda_a) if not np.isnan(lambda_a) else None,
+            'lambda_c': float(lambda_c) if not np.isnan(lambda_c) else None,
+            'lambda_a_upd': float(lambda_a_upd) if not np.isnan(lambda_a_upd) else None,
+            'lambda_c_upd': float(lambda_c_upd) if not np.isnan(lambda_c_upd) else None,
+            'eta': float(eta),
+        })
+    return rows
+
+
+def stream(
+    batch_set: Rist,
+    arch_params: Rist,
+    use_model: Rist = None,
+    checkpoint_dir: Optional[str] = None,
+) -> Rist:
     """
     Run full anomaly detection stream over multiple batches.
 
@@ -1506,18 +1580,20 @@ def stream(batch_set: Rist, arch_params: Rist, use_model: Rist = None) -> Rist:
         batch_set (Rist): Sequence of batches, each a Rist of detectors.
         arch_params (Rist): Pipeline configuration parameters.
         use_model (Rist, optional): Pretrained ustat per detector.
+        checkpoint_dir (str, optional): Directory to save checkpoint files.
+            If None, all results are kept in memory (original behavior).
+            If specified, results are saved incrementally and memory is cleared.
 
     Returns:
-        Rist: {
-            'res_net': updated results per detector,
-            'coinc_lis': coincidence results over batches,
-            'model': final ustat per detector,
-            'arch_params': unchanged input config,
-            'summary': polars.DataFrame summarizing final ustat,
-            'eta': list of elapsed times per batch
-        }
+        Rist:
+            If checkpoint_dir is None:
+                {'res_net', 'coinc_lis', 'model', 'arch_params', 'summary', 'eta'}
+            If checkpoint_dir is specified:
+                {'model', 'arch_params', 'summary', 'checkpoint_dir'}
+                (res_net and coinc_lis are saved to disk and cleared from memory)
     """
     dets = batch_set[0].names
+    checkpoint_mode = checkpoint_dir is not None
 
     prev_batch, res_net, coinc_lis = init_pipe(dets)
 
@@ -1525,6 +1601,19 @@ def stream(batch_set: Rist, arch_params: Rist, use_model: Rist = None) -> Rist:
     if use_model is not None:
         for det in dets:
             res_net[det]["ustat"] = Rist(use_model[det])
+
+    # Setup checkpoint directories and writers
+    if checkpoint_mode:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        proc_dir = os.path.join(checkpoint_dir, "proc")
+        coinc_dir = os.path.join(checkpoint_dir, "coinc")
+        os.makedirs(proc_dir, exist_ok=True)
+        os.makedirs(coinc_dir, exist_ok=True)
+
+        # Initialize ParquetWriter for summary
+        summary_path = os.path.join(checkpoint_dir, "summary.parquet")
+        summary_schema = _get_summary_schema(dets)
+        summary_writer = pq.ParquetWriter(summary_path, summary_schema)
 
     eta_lis = []
     for i in range(len(batch_set)):
@@ -1539,30 +1628,85 @@ def stream(batch_set: Rist, arch_params: Rist, use_model: Rist = None) -> Rist:
             arch_params=arch_params
         )
 
-        eta_lis.append(time.time() - start)
+        eta = time.time() - start
+        eta_lis.append(eta)
 
-    # Summary (last ustat per detector)
-    summary_rows = []
-    for det in dets:
-        last_ustat = res_net[det]["ustat"][-1]
-        df_row = pl.DataFrame(last_ustat.to_dict(flat=True)).with_columns(
-            pl.lit(det).alias("detector"),
-            pl.lit(batch_set[0][det].start).alias("start_time"),
+        # Checkpoint mode: save and clear memory
+        if checkpoint_mode:
+            batch_id = i + 1
+
+            # 1) Save proc for each detector
+            for det in dets:
+                proc = res_net[det]["proc"]
+                if proc is not None and not is_all_nan(proc):
+                    proc_path = os.path.join(proc_dir, f"batch_{batch_id:04d}_{det}.parquet")
+                    proc.write_parquet(proc_path)
+
+            # 2) Save coinc
+            coinc_res = coinc_lis[-1] if len(coinc_lis) > 0 else None
+            if coinc_res is not None:
+                coinc_path = os.path.join(coinc_dir, f"batch_{batch_id:04d}.parquet")
+                coinc_res.write_parquet(coinc_path)
+
+            # 3) Append summary rows
+            summary_rows = _build_summary_rows(batch_id, dets, res_net, eta)
+            summary_table = pa.Table.from_pylist(summary_rows, schema=summary_schema)
+            summary_writer.write_table(summary_table)
+
+            # 4) Clear memory: keep only last ustat for next batch
+            for det in dets:
+                res_net[det]["proc"] = None
+                res_net[det]["stat"] = Rist()
+                res_net[det]["lamb"] = Rist()
+                # Keep only the last ustat (needed for next batch)
+                last_ustat = res_net[det]["ustat"][-1]
+                res_net[det]["ustat"] = Rist(last_ustat)
+
+            coinc_lis = Rist()
+
+    # Finalize
+    if checkpoint_mode:
+        summary_writer.close()
+
+        # Save final model
+        model = Rist(**{det: res_net[det]["ustat"][-1] for det in dets})
+        model_path = os.path.join(checkpoint_dir, "model.pkl")
+        model.save(model_path)
+
+        # Load summary back for return value
+        summary_df = pl.read_parquet(summary_path)
+
+        return Rist(
+            model=model,
+            arch_params=arch_params,
+            summary=summary_df,
+            eta=eta_lis,
+            checkpoint_dir=checkpoint_dir,
         )
-        summary_rows.append(df_row)
-    summary_df = pl.concat(summary_rows, how="vertical")
+    else:
+        # Original behavior: keep everything in memory
+        # Summary (last ustat per detector)
+        summary_rows = []
+        for det in dets:
+            last_ustat = res_net[det]["ustat"][-1]
+            df_row = pl.DataFrame(last_ustat.to_dict(flat=True)).with_columns(
+                pl.lit(det).alias("detector"),
+                pl.lit(batch_set[0][det].start).alias("start_time"),
+            )
+            summary_rows.append(df_row)
+        summary_df = pl.concat(summary_rows, how="vertical")
 
-    # Final model: last ustat per detector
-    model = Rist(**{det: res_net[det]["ustat"][-1] for det in dets})
+        # Final model: last ustat per detector
+        model = Rist(**{det: res_net[det]["ustat"][-1] for det in dets})
 
-    return Rist(
-        res_net=res_net,
-        coinc_lis=coinc_lis,
-        model=model,
-        arch_params=arch_params,
-        summary=summary_df,
-        eta=eta_lis,
-    )
+        return Rist(
+            res_net=res_net,
+            coinc_lis=coinc_lis,
+            model=model,
+            arch_params=arch_params,
+            summary=summary_df,
+            eta=eta_lis,
+        )
 
 
 def reproduce(
@@ -1709,19 +1853,15 @@ def reproduce(
     l1_proc: pl.DataFrame = updated_res_net["L1"]["proc"]
 
     # Use per-detector P0 (do not rename here; coincide_P0 handles internal renaming)
-    coinc_res: pl.DataFrame = cast(
-        pl.DataFrame,
-        coincide_P0(
-            shift_proc=h1_proc,
-            ref_proc=l1_proc,
-            n_shift=None,
-            window_size=ws,
-            overlap=ov,
-            step_size=None,
-            mean_func=mean_func,
-            p_col="P0",
-            return_mode=1,
-        ),
+    coinc_res: pl.DataFrame = coincide_P0(
+        shift_proc=h1_proc,
+        ref_proc=l1_proc,
+        n_shift=None,
+        window_size=ws,
+        overlap=ov,
+        step_size=None,
+        mean_func=mean_func,
+        p_col="P0",
     )
 
     # --- 6) Return Rist result ---

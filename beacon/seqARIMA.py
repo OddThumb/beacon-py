@@ -1117,6 +1117,7 @@ def extract_seqarima_params(seqarima_obj) -> Rist:
     if hasattr(seqarima_obj, "ma_meta") and seqarima_obj.ma_meta is not None:
         q = seqarima_obj.ma_meta.q_order
         params["q_list"] = list(np.atleast_1d(q))
+        params["ma_collector"] = seqarima_obj.ma_meta.ma_collector
 
     # Bandpass (optional)
     if hasattr(seqarima_obj, "bp_meta") and seqarima_obj.bp_meta is not None:
@@ -1456,3 +1457,76 @@ def psd_seqarima(f: np.ndarray, params: Rist) -> np.ndarray:
     var = var_seqarima(f, params)
 
     return var / np.abs(Hf) ** 2
+
+
+# ________________________________________________________________
+# Prediction using trained seqARIMA model
+
+def pred_seqarima(
+    ts_obj: ts,
+    params: Rist,
+    verbose: bool = True,
+) -> ts:
+    """
+    Apply seqARIMA filtering using extracted parameters.
+
+    This function applies the same filtering pipeline (Diff -> AR -> MA -> BP)
+    using parameters extracted from a trained model via extract_seqarima_params().
+
+    Args:
+        ts_obj (ts): Input time series to filter.
+        params (Rist): Parameters from extract_seqarima_params() containing:
+            - fs: sampling frequency
+            - ar_coef (required): AR coefficients
+            - var_pred: AR prediction variance
+            - d (optional): differencing order
+            - q_list (optional): MA window sizes
+            - ma_collector (optional): MA aggregation method
+            - fl, fu (optional): bandpass cutoffs
+            - bp_order (optional): bandpass filter order
+
+    Returns:
+        ts: Filtered time series.
+
+    Example:
+        >>> # Train on noise data
+        >>> arm_noise = bc.seqARIMA.seqarima(noise_data, p=4096, d=2, q=range(1,21), fl=32, fu=512)
+        >>>
+        >>> # Extract parameters (can be saved/loaded separately)
+        >>> params = bc.seqARIMA.extract_seqarima_params(arm_noise)
+        >>> params.save("seqarima_params.pkl")
+        >>>
+        >>> # Apply to target signal
+        >>> filtered_signal = bc.seqARIMA.pred_seqarima(signal_data, params=params)
+    """
+    message_verb("> Applying seqARIMA filtering...", verb=verbose)
+
+    out = ts_obj
+
+    # Step 1: Differencing (optional)
+    if has_param(params, "d") and params.d > 0:
+        message_verb(f"> (1) Differencing: d={params.d}", verb=verbose)
+        out = Differencing(out, d=params.d, verbose=False)
+
+    # Step 2: AR filtering (required)
+    if not has_param(params, "ar_coef"):
+        raise ValueError("params must contain ar_coef (AR stage is required)")
+
+    ar_coef = params.ar_coef
+    message_verb(f"> (2) AR filtering: p={len(ar_coef)}", verb=verbose)
+    out = pred_resid(out, arcoef=ar_coef)
+
+    # Step 3: Moving Average (optional)
+    if has_param(params, "q_list"):
+        q_list = params.q_list
+        ma_collector = params.ma_collector if has_param(params, "ma_collector") else "mean"
+        message_verb(f"> (3) Moving Average: q={q_list}, collector={ma_collector}", verb=verbose)
+        out = MovingAverage(out, q=q_list, verbose=False, collector=ma_collector)
+
+    # Step 4: Bandpass (optional)
+    if has_param(params, "fl") and has_param(params, "fu"):
+        fl, fu = params.fl, params.fu
+        message_verb(f"> (4) Bandpass: {fl}-{fu} Hz", verb=verbose)
+        out = BandPass(out, fl=fl, fu=fu, verbose=False)
+
+    return out

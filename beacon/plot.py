@@ -38,6 +38,7 @@ def plot_oscillo(
     color=None,
     label=None,
     figsize=(8, 3),
+    xticks=7,
     **kwargs,
 ):
     """
@@ -89,7 +90,7 @@ def plot_oscillo(
     # Axis labels
     ax.set_xlabel(f"Time {'- $t_0$ ' if tzero else ''}(s)")
     ax.set_xlim(times[0], times[-1])
-    ax.xaxis.set_major_locator(MaxNLocator(10))
+    ax.xaxis.set_major_locator(MaxNLocator(xticks))
 
     # Y ticks
     ax.yaxis.set_major_locator(MaxNLocator(5))
@@ -241,6 +242,7 @@ def plot_spectro(
     figsize_osci=(8, 2),
     show_colorbar=True,
     label_colorbar=None,
+    xticks=7,
 ):
     """
     Plot Q-transform spectrogram and oscillogram with optional inset colorbar.
@@ -277,6 +279,7 @@ def plot_spectro(
             - np.sqrt: r"$\\sqrt{\\text{Normalized energy}}$"
             - np.log: r"$\\ln$(Normalized energy)"
             Default: None (auto-detect).
+        xticks (int): Number of x-axis ticks. Default: 7.
 
     Returns:
         matplotlib.figure.Figure or tuple of Figures
@@ -390,6 +393,9 @@ def plot_spectro(
     else:
         ax_spec.tick_params(axis="y", labelleft=False)
 
+    # X-axis tick count
+    ax_spec.xaxis.set_major_locator(MaxNLocator(xticks))
+
     if grid in ["x", "xy"]:
         ax_spec.xaxis.grid(True, linestyle="--", alpha=0.3)
     if grid in ["y", "xy"]:
@@ -440,7 +446,7 @@ def plot_spectro(
         dummy_ax.axis("off")  # Hide the dummy axes
 
     # Oscillogram
-    ax = plot_oscillo(ts_crop, tzero=tzero, trange=trange, ax=ax_osci, lw=0.5)
+    ax = plot_oscillo(ts_crop, tzero=tzero, trange=trange, ax=ax_osci, lw=0.5, xticks=xticks)
 
     if not show_osci_xlabel:
         ax.set_xlabel("")

@@ -1414,8 +1414,6 @@ def var_seqarima(f: np.ndarray, params: Rist) -> float:
     bw = fs / 2
     H_total_sq = np.ones_like(f)
 
-    if has_param(params, "d"):
-        H_total_sq *= np.abs(H_diff(f, fs, params.d)) ** 2
     if has_param(params, "q_list"):
         H_total_sq *= np.abs(H_eoa(f, fs, params.q_list)) ** 2
     if has_param(params, "fl") and has_param(params, "fu"):
@@ -1423,8 +1421,7 @@ def var_seqarima(f: np.ndarray, params: Rist) -> float:
         H_total_sq *= np.abs(H_bp(f, fs, params.fl, params.fu, bp_order)) ** 4
         bw = params.fu - params.fl
     
-    var_filtered = var_pred * (2 / fs) * np.sum(H_total_sq) * df
-    var_filtered /= bw
+    var_filtered = var_pred * np.sum(H_total_sq) * df / bw
 
     return var_filtered
 

@@ -1423,8 +1423,7 @@ def var_seqarima(f: np.ndarray, params: Rist) -> float:
         H_total_sq *= np.abs(H_bp(f, fs, params.fl, params.fu, bp_order)) ** 4
         bw = params.fu - params.fl
     
-    var_filtered = var_pred * (2 / fs) * np.sum(H_total_sq) * df
-    var_filtered /= bw
+    var_filtered = var_pred * np.sum(H_total_sq) * df / bw
 
     return var_filtered
 

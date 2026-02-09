@@ -644,6 +644,7 @@ def Autoregressive(
     meta = Rist(
         ar_coef=result.ar_coef,
         var_pred=result.var_pred,
+        parcor=result.partialacf,
         p_order=result.p_order,
         ar_collector=result.ar_collector,
     )
@@ -1263,90 +1264,6 @@ def H_bp(
     return H
 
 
-# seqARIMA variance
-def seqarima_variance(seqarima_obj) -> Rist:
-    """
-    Compute filtered noise variance from seqARIMA result.
-
-    AR stage is required for white noise assumption.
-
-    Args:
-        seqarima_obj: seqarima result object with ar_meta attribute.
-
-    Returns:
-        Rist with var_filtered, stages, details.
-    """
-    p = extract_seqarima_params(seqarima_obj)
-    n_freq = 10000
-
-    # 주파수 범위
-    if has_param(p, "fl"):
-        f = np.linspace(p.fl, p.fu, n_freq)
-    else:
-        f = np.linspace(1e-6, p.fs / 2, n_freq)
-    df = f[1] - f[0]
-
-    stages = []
-    details = Rist(sampling_freq=p.fs, var_pred=p.var_pred)
-    H_total_sq = np.ones_like(f)
-
-    # Step 1: Diff (AR absorbs diff, so only track for logging)
-    if has_param(p, "d"):
-        details["d"] = p.d
-        stages.append(f"diff (d={p.d}, absorbed by AR)")
-
-    stages.append("ar (whitened)")
-
-    # Step 2: EoA
-    if has_param(p, "q_list"):
-        H_total_sq *= np.abs(H_eoa(f, p.fs, p.q_list)) ** 2
-        stages.append(f"eoa (q={p.q_list})")
-        details["q_list"] = p.q_list
-
-    # Step 3: BP
-    if has_param(p, "fl"):
-        bp_order = p.bp_order if has_param(p, "bp_order") else 512
-        H_total_sq *= np.abs(H_bp(f, p.fs, p.fl, p.fu, bp_order)) ** 4
-        stages.append(f"bp ({p.fl}-{p.fu} Hz)")
-        details["fl"] = p.fl
-        details["fu"] = p.fu
-        details["bp_order"] = bp_order
-
-    # Final variance
-    var_filtered = p.var_pred * (2 / p.fs) * np.sum(H_total_sq) * df
-
-    return Rist(var_filtered=var_filtered, stages=Rist(stages), details=details)
-
-
-# Signal-to-noise ratio
-def envelope_snr(seqarima_obj) -> np.ndarray:
-    """
-    Compute envelope SNR time series from seqarima result.
-
-    SNR(t) = A(t) / sqrt(2 * var_filtered)
-
-    where A(t) is the envelope (magnitude of analytic signal).
-    Normalized so E[SNR] = 1 for noise only (chi-squared with 2 DOF).
-
-    Args:
-        seqarima_obj: seqarima result object with ar_meta attribute.
-
-    Returns:
-        ts: SNR time series with variance_result attribute.
-    """
-    result = seqarima_variance(seqarima_obj)
-    sigma2 = result.var_filtered
-
-    analytic_signal = hilbert(seqarima_obj.data)
-    envelope = np.abs(analytic_signal)
-
-    snr_ts = np.sqrt(envelope**2 / (2 * sigma2))
-    snr_ts = tsref(snr_ts, seqarima_obj)
-    snr_ts.variance_result = result
-
-    return snr_ts
-
-
 # ________________________________________________________________
 # Combined transfer function and PSD estimation
 
@@ -1387,23 +1304,18 @@ def H_seqarima(f: np.ndarray, params: Rist) -> np.ndarray:
     return H_out
 
 
-def var_seqarima(f: np.ndarray, params: Rist) -> float:
+def var_seqarima(
+    f: np.ndarray, params: Rist, domain: Literal["freq", "time"] = "freq"
+) -> float:
     """
     Noise variance after seqARIMA filtering.
 
     Args:
         f: Frequency array (Hz)
         params: Rist containing seqARIMA parameters.
-
-    Required params:
-        - fs: Sampling frequency (Hz)
-        - var_pred: AR prediction variance
-
-    Optional params:
-        - d: Differencing order
-        - q_list: EoA window sizes
-        - fl, fu: Bandpass cutoffs (Hz)
-        - bp_order: Bandpass filter order (default: 512)
+        domain:
+            - "freq": Frequency-domain variance (normalized by bandwidth)
+            - "time": Time-domain variance (Parseval's theorem)
 
     Returns:
         Filtered noise variance
@@ -1411,19 +1323,25 @@ def var_seqarima(f: np.ndarray, params: Rist) -> float:
     fs = params.fs
     var_pred = params.var_pred
     df = f[1] - f[0]
-    bw = fs / 2
+
     H_total_sq = np.ones_like(f)
 
     if has_param(params, "q_list"):
         H_total_sq *= np.abs(H_eoa(f, fs, params.q_list)) ** 2
+
     if has_param(params, "fl") and has_param(params, "fu"):
         bp_order = params.bp_order if has_param(params, "bp_order") else 512
         H_total_sq *= np.abs(H_bp(f, fs, params.fl, params.fu, bp_order)) ** 4
-        bw = params.fu - params.fl
-    
-    var_filtered = var_pred * np.sum(H_total_sq) * df / bw / (fs / 2)
 
-    return var_filtered
+    integral = np.sum(H_total_sq) * df
+
+    if domain == "time":
+        # Time-domain: Parseval's theorem σ² = (2/fs) ∫|H|² df
+        return var_pred * (2 / fs) * integral
+    else:  # "freq"
+        # Frequency-domain: normalized by bandwidth
+        bw = (params.fu - params.fl) if has_param(params, "fl") else (fs / 2)
+        return var_pred * integral / bw / (fs / 2)
 
 
 def psd_seqarima(f: np.ndarray, params: Rist) -> np.ndarray:
@@ -1454,6 +1372,35 @@ def psd_seqarima(f: np.ndarray, params: Rist) -> np.ndarray:
     var = var_seqarima(f, params)
 
     return var / np.abs(Hf) ** 2
+
+
+# Signal-to-noise ratio
+def envelope_snr(seqarima_obj) -> np.ndarray:
+    """
+    Compute envelope SNR time series from seqarima result.
+
+    SNR(t) = A(t) / sqrt(2 * var_filtered)
+
+    where A(t) is the envelope (magnitude of analytic signal).
+    Normalized so E[SNR] = 1 for noise only (chi-squared with 2 DOF).
+
+    Args:
+        seqarima_obj: seqarima result object with ar_meta attribute.
+
+    Returns:
+        ts: SNR time series with variance_result attribute.
+    """
+    params = extract_seqarima_params(seqarima_obj)
+    freqs = np.fft.rfftfreq(seqarima_obj.length)
+    sigma2 = var_seqarima(f=freqs, params=params)
+
+    analytic_signal = hilbert(seqarima_obj.data)
+    envelope = np.abs(analytic_signal)
+
+    snr_ts = np.sqrt(envelope**2 / (2 * sigma2))
+    snr_ts = tsref(snr_ts, seqarima_obj)
+
+    return snr_ts
 
 
 # ________________________________________________________________

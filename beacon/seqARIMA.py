@@ -521,6 +521,7 @@ def sar(
         resid=resid_ts,
         ar_coef=ar_result.ar,
         var_pred=ar_result.var_pred,
+        parcor=ar_result.partialacf,
         p_order=p,
         ar_collector="single",
         AR_obj=ar_result,
@@ -582,11 +583,12 @@ def ear(
     # Build Rist for ar_coef and var_pred keyed by p order
     ar_coef_rist = Rist({f"ar{fit.order}": fit.ar for fit in ar_fits})
     var_pred_rist = Rist({f"ar{fit.order}": fit.var_pred for fit in ar_fits})
-
+    parcor_rist = Rist({f"ar{fit.order}": fit.partialacf for fit in ar_fits})
     return Rist(
         resid=resids_ts,
         ar_coef=ar_coef_rist,
         var_pred=var_pred_rist,
+        parcor=parcor_rist,
         p_order=psel,
         ar_collector=ar_collector_name,
     )
@@ -644,7 +646,7 @@ def Autoregressive(
     meta = Rist(
         ar_coef=result.ar_coef,
         var_pred=result.var_pred,
-        parcor=result.partialacf,
+        parcor=result.parcor,
         p_order=result.p_order,
         ar_collector=result.ar_collector,
     )

@@ -1342,8 +1342,8 @@ def pipe(
             P_update=P_update,
             proc=proc,
             prev_tcen=prev_tcen,
-            use_ema=arch_params.get("use_ema", False),
-            ema_alpha=arch_params.get("ema_alpha", 0.1),
+            use_ema=arch_params["use_ema"],
+            ema_alpha=arch_params["ema_alpha"],
         )
 
         # Extract the last cluster's t_cen for the next batch

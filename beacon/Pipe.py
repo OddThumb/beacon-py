@@ -580,7 +580,7 @@ def config_pipe(replace: Optional[Rist] = None, show_config: bool = True) -> Ris
         sampling_freq=f_sampl,
         arch=arch,
         DQ="BURST_CAT2",
-        n_workers=None, # Defulat is None, this will be handled inside pipe_net()
+        n_workers=None,  # Defulat is None, this will be handled inside pipe_net()
         # seqARIMA
         d=2,
         p=1024,
@@ -600,6 +600,8 @@ def config_pipe(replace: Optional[Rist] = None, show_config: bool = True) -> Ris
         mean_func=har_mean,
         # lambda update cutoff
         P_update=0.05,
+        use_ema=False,
+        ema_alpha=0.1,
     )
 
     # Replace values with user-provided overrides
@@ -1179,6 +1181,51 @@ def update_stat(upd: Rist, cur: Rist) -> Rist:
         )
     )
 
+def update_stat_ema(upd: Rist, cur: Rist, alpha: float = 0.1) -> Rist:
+    """
+    EMA 방식으로 λ 업데이트.
+
+    λ_new = α * λ_current + (1-α) * λ_old
+
+    Args:
+        upd (Rist): 이전 업데이트된 통계.
+        cur (Rist): 현재 배치 통계.
+        alpha (float): EMA smoothing factor (0 < α ≤ 1).
+                       α가 클수록 최근 값에 민감.
+    """
+    # Current batch lambda
+    lambda_c_cur = cur.stats["lambda_c"]
+    lambda_a_cur = cur.stats["lambda_a"]
+
+    # Previous updated lambda
+    lambda_c_old = upd.stats["lambda_c"]
+    lambda_a_old = upd.stats["lambda_a"]
+
+    # EMA update (첫 배치면 current 값 그대로 사용)
+    if np.isnan(lambda_c_old):
+        lambda_c_upd = lambda_c_cur
+    else:
+        lambda_c_upd = alpha * lambda_c_cur + (1 - alpha) * lambda_c_old
+
+    if np.isnan(lambda_a_old):
+        lambda_a_upd = lambda_a_cur
+    else:
+        lambda_a_upd = alpha * lambda_a_cur + (1 - alpha) * lambda_a_old
+
+    # Cumulative counts는 tracking용으로 유지
+    t_batch_upd = upd.stats["t_batch"] + cur.stats["t_batch"]
+    N_cl_upd = upd.stats["N_cl"] + cur.stats["N_cl"]
+    N_anom_upd = upd.stats["N_anom"] + cur.stats["N_anom"]
+
+    return Rist(
+        stats=Rist(
+            t_batch=t_batch_upd,
+            N_cl=N_cl_upd,
+            N_anom=N_anom_upd,
+            lambda_c=lambda_c_upd,
+            lambda_a=lambda_a_upd,
+        )
+    )
 
 def update_logic(
     updated: Optional[Rist],
@@ -1186,6 +1233,8 @@ def update_logic(
     P_update: Optional[float] = None,
     proc: Optional[pl.DataFrame] = None,
     prev_tcen: Optional[float] = None,
+    use_ema: bool = False,
+    ema_alpha: float = 0.1,
 ) -> Rist:
     """
     Logic to update statistics given current and previous stats.
@@ -1226,13 +1275,20 @@ def update_logic(
 
             # Recompute current statistics
             current_filtered = stat_anom(proc_filtered, last_tcen=prev_tcen)
-
-            # Update statistics with filtered statistics
-            updated_new = update_stat(upd=updated, cur=current_filtered)
         else:
-            # Ordinary updating procedure w/o any filtering
-            updated_new = update_stat(upd=updated, cur=current)
+            current_filtered = current
 
+        if use_ema:
+            updated_new = update_stat_ema(upd=updated, cur=current_filtered, alpha=ema_alpha)
+        else:
+            updated_new = update_stat(upd=updated, cur=current_filtered)
+
+        #    # Update statistics with filtered statistics
+        #    updated_new = update_stat(upd=updated, cur=current_filtered)
+        #else:
+        #    # Ordinary updating procedure w/o any filtering
+        #    updated_new = update_stat(upd=updated, cur=current)
+        
         return updated_new
 
 
@@ -1286,6 +1342,8 @@ def pipe(
             P_update=P_update,
             proc=proc,
             prev_tcen=prev_tcen,
+            use_ema=arch_params.get("use_ema", False),
+            ema_alpha=arch_params.get("ema_alpha", 0.1),
         )
 
         # Extract the last cluster's t_cen for the next batch

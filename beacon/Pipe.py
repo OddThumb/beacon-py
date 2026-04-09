@@ -582,7 +582,8 @@ def config_pipe(replace: Optional[Rist] = None, show_config: bool = True) -> Ris
         DQ="BURST_CAT2",
         n_workers=None,  # Defulat is None, this will be handled inside pipe_net()
         # seqARIMA
-        d=2,
+        d="auto",
+        d_max=2,
         p=1024,
         q=range(1, 21),
         fl=32,
@@ -600,10 +601,10 @@ def config_pipe(replace: Optional[Rist] = None, show_config: bool = True) -> Ris
         mean_func=har_mean,
         # lambda update cutoff
         P_update=0.05,
-        use_ema=False,
-        ema_alpha=0.1,
+        smooth="cumulative",   # "cumulative" | "ema" | "kalman"
+        smooth_params=None,    # {"alpha": 0.1} or {"q": 1e-4, "r": 1e-2}
     )
-
+    
     # Replace values with user-provided overrides
     if replace is not None:
         if not isinstance(replace, Rist):
@@ -619,7 +620,8 @@ def config_pipe(replace: Optional[Rist] = None, show_config: bool = True) -> Ris
             conf[name] = replace[name]
 
     # Compute n_missed = (Mh, Mt) based on ARIMA loss size
-    conf["n_missed"] = tr_overlap(conf["d"], conf["p"], conf["q"], split=True)
+    conf["q_max"] = 0 if conf["q"] is None else np.max(conf["q"])
+    conf["n_missed"] = tr_overlap(conf["d_max"], conf["p"], conf["q_max"], split=True)
 
     # Print configuration if requested
     if show_config:
@@ -856,10 +858,8 @@ def rist_append(
 def append_result_NaN(res_rist: Rist) -> Rist:
     rist_append(res_rist, "stat", np.nan)
     rist_append(res_rist, "lamb", Rist(a=np.nan, c=np.nan))
-    rist_append(res_rist, "prob", np.nan)
-    rist_append(res_rist, "proc", np.nan)
-    rist_append(res_rist, "updated_stat", np.nan)
-    rist_append(res_rist, "current_stat", np.nan)
+    rist_append(res_rist, "ustat", res_rist["ustat"][-1])
+    res_rist["proc"] = np.nan
     return res_rist
 
 
@@ -1181,51 +1181,109 @@ def update_stat(upd: Rist, cur: Rist) -> Rist:
         )
     )
 
-def update_stat_ema(upd: Rist, cur: Rist, alpha: float = 0.1) -> Rist:
+def update_stat_smooth(
+    upd: Rist, cur: Rist,
+    method: str = "ema",
+    alpha: float = None,
+    N_eff: int = None,
+    q: float = 1e-4,
+    r: float = 1e-2,
+) -> Rist:
     """
-    EMA 방식으로 λ 업데이트.
+    Smooth λ update via fixed-α EMA or adaptive Kalman filter.
 
-    λ_new = α * λ_current + (1-α) * λ_old
+    method="ema":
+        If N_eff is given:
+            α_t = 1 / min(n_batch, N_eff)
+            Warm-up: behaves as cumulative average until n_batch reaches N_eff,
+            then holds α = 1/N_eff. (Abbott et al. 2020)
+        If alpha is given:
+            α_t = alpha (fixed, no warm-up)
+
+    method="kalman":
+        Scalar Kalman filter on random-walk + noise model (Muth 1960).
+        K_t = (P_{t-1} + q) / (P_{t-1} + q + r)    (adaptive gain)
+        λ_new = λ_old + K_t * (λ_cur - λ_old)
 
     Args:
-        upd (Rist): 이전 업데이트된 통계.
-        cur (Rist): 현재 배치 통계.
-        alpha (float): EMA smoothing factor (0 < α ≤ 1).
-                       α가 클수록 최근 값에 민감.
+        upd (Rist): Previously updated statistics.
+        cur (Rist): Current batch statistics.
+        method (str): "ema" for fixed-α, "kalman" for adaptive gain.
+        alpha (float or None): Fixed smoothing factor (method="ema", no warm-up).
+        N_eff (int or None): Effective window size (method="ema", with warm-up).
+            If both alpha and N_eff are None, defaults to alpha=0.1.
+        q (float): Process noise variance (method="kalman").
+        r (float): Observation noise variance (method="kalman").
     """
-    # Current batch lambda
     lambda_c_cur = cur.stats["lambda_c"]
     lambda_a_cur = cur.stats["lambda_a"]
-
-    # Previous updated lambda
     lambda_c_old = upd.stats["lambda_c"]
     lambda_a_old = upd.stats["lambda_a"]
 
-    # EMA update (첫 배치면 current 값 그대로 사용)
-    if np.isnan(lambda_c_old):
-        lambda_c_upd = lambda_c_cur
-    else:
-        lambda_c_upd = alpha * lambda_c_cur + (1 - alpha) * lambda_c_old
+    # Track batch count
+    n_batch_prev = upd.stats["n_batch"] if "n_batch" in upd.stats._name_to_index else 1
+    n_batch = n_batch_prev + 1
 
-    if np.isnan(lambda_a_old):
-        lambda_a_upd = lambda_a_cur
-    else:
-        lambda_a_upd = alpha * lambda_a_cur + (1 - alpha) * lambda_a_old
+    if method == "kalman":
+        P_c = upd.stats["P_c"] if "P_c" in upd.stats._name_to_index else r
+        P_a = upd.stats["P_a"] if "P_a" in upd.stats._name_to_index else r
 
-    # Cumulative counts는 tracking용으로 유지
+        if np.isnan(lambda_c_old):
+            lambda_c_upd, P_c_new = lambda_c_cur, r
+        else:
+            P_c_pred = P_c + q
+            K_c = P_c_pred / (P_c_pred + r)
+            lambda_c_upd = lambda_c_old + K_c * (lambda_c_cur - lambda_c_old)
+            P_c_new = (1 - K_c) * P_c_pred
+
+        if np.isnan(lambda_a_old):
+            lambda_a_upd, P_a_new = lambda_a_cur, r
+        else:
+            P_a_pred = P_a + q
+            K_a = P_a_pred / (P_a_pred + r)
+            lambda_a_upd = lambda_a_old + K_a * (lambda_a_cur - lambda_a_old)
+            P_a_new = (1 - K_a) * P_a_pred
+    else:
+        # Determine α_t
+        if N_eff is not None:
+            alpha_t = 1.0 / min(n_batch, N_eff)
+        elif alpha is not None:
+            alpha_t = alpha
+        else:
+            alpha_t = 0.1
+
+        if np.isnan(lambda_c_old):
+            lambda_c_upd = lambda_c_cur
+        else:
+            lambda_c_upd = alpha_t * lambda_c_cur + (1 - alpha_t) * lambda_c_old
+
+        if np.isnan(lambda_a_old):
+            lambda_a_upd = lambda_a_cur
+        else:
+            lambda_a_upd = alpha_t * lambda_a_cur + (1 - alpha_t) * lambda_a_old
+
+        P_c_new, P_a_new = None, None
+
     t_batch_upd = upd.stats["t_batch"] + cur.stats["t_batch"]
     N_cl_upd = upd.stats["N_cl"] + cur.stats["N_cl"]
     N_anom_upd = upd.stats["N_anom"] + cur.stats["N_anom"]
 
-    return Rist(
+    result = Rist(
         stats=Rist(
             t_batch=t_batch_upd,
             N_cl=N_cl_upd,
             N_anom=N_anom_upd,
             lambda_c=lambda_c_upd,
             lambda_a=lambda_a_upd,
+            n_batch=n_batch,
         )
     )
+
+    if P_c_new is not None:
+        result.stats["P_c"] = P_c_new
+        result.stats["P_a"] = P_a_new
+
+    return result
 
 def update_logic(
     updated: Optional[Rist],
@@ -1233,8 +1291,8 @@ def update_logic(
     P_update: Optional[float] = None,
     proc: Optional[pl.DataFrame] = None,
     prev_tcen: Optional[float] = None,
-    use_ema: bool = False,
-    ema_alpha: float = 0.1,
+    smooth: str = "cumulative",
+    smooth_params: Optional[dict] = None,
 ) -> Rist:
     """
     Logic to update statistics given current and previous stats.
@@ -1245,22 +1303,21 @@ def update_logic(
         P_update (float or None): Threshold to apply FAP filtering.
         proc (pl.DataFrame): Full detection result for current batch.
         prev_tcen (float): Previous central time (for stat_anom).
+        smooth (str): "cumulative" (default), "ema" (fixed-α), or "kalman" (adaptive).
+        smooth_params (dict or None): Parameters for smooth method.
+            - "ema": {"alpha": float} or {"N_eff": int}
+            - "kalman": {"q": float, "r": float}
 
     Returns:
         Rist: Updated statistics.
     """
-    # updated_stat cannot be NA except for the first batch
     if updated is None or is_all_nan(updated.stats):
-        # use current_stat
         return current
 
     elif current is None or is_all_nan(current.stats):
-        # use only updated_stat so far
         return updated
     else:
-        # Perform updating procedure
         if P_update is not None:
-            # Filter out anomalies with FAP < P_update
             proc_filtered = proc.with_columns(
                 [
                     pl.when(pl.col("P0") < P_update)
@@ -1269,26 +1326,19 @@ def update_logic(
                     .alias("anomaly")
                 ]
             )
-            # If computed FAP < P_update, it's less-likely from noise fluctuations.
-            # Thus, exclude those FAP < P_update by changing anomaly==1 into anomaly==0
-            # Then following function `stat_anom` will filter out anomaly==0 in calculating statistics.
-
-            # Recompute current statistics
             current_filtered = stat_anom(proc_filtered, last_tcen=prev_tcen)
         else:
             current_filtered = current
 
-        if use_ema:
-            updated_new = update_stat_ema(upd=updated, cur=current_filtered, alpha=ema_alpha)
-        else:
+        if smooth == "cumulative":
             updated_new = update_stat(upd=updated, cur=current_filtered)
+        else:
+            params = smooth_params or {}
+            updated_new = update_stat_smooth(
+                upd=updated, cur=current_filtered,
+                method=smooth, **params,
+            )
 
-        #    # Update statistics with filtered statistics
-        #    updated_new = update_stat(upd=updated, cur=current_filtered)
-        #else:
-        #    # Ordinary updating procedure w/o any filtering
-        #    updated_new = update_stat(upd=updated, cur=current)
-        
         return updated_new
 
 
@@ -1342,8 +1392,8 @@ def pipe(
             P_update=P_update,
             proc=proc,
             prev_tcen=prev_tcen,
-            use_ema=arch_params["use_ema"],
-            ema_alpha=arch_params["ema_alpha"],
+            smooth=arch_params["smooth"],
+            smooth_params=arch_params["smooth_params"],
         )
 
         # Extract the last cluster's t_cen for the next batch

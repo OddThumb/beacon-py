@@ -912,6 +912,8 @@ def concat_ts(prev: ts, curr: ts, n_former: int) -> ts:
     """
     if prev is None:
         return curr
+    elif np.all(np.isnan(prev.data)):
+        return curr
     elif prev.length < n_former:
         return curr
 

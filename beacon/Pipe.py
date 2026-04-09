@@ -1168,10 +1168,10 @@ def update_stat(upd: Rist, cur: Rist) -> Rist:
     N_anom_upd = upd.stats["N_anom"] + cur.stats["N_anom"]
 
     # Update lambda_c
-    lambda_c_upd = N_cl_upd / t_batch_upd
+    lambda_c_upd = N_cl_upd / t_batch_upd if t_batch_upd != 0 else np.nan
 
     # Update lambda_a
-    lambda_a_upd = N_anom_upd / N_cl_upd
+    lambda_a_upd = N_anom_upd / N_cl_upd if N_cl_upd != 0 else np.nan
 
     # Return (`last_tcen` will be added in pipe(), outside)
     return Rist(

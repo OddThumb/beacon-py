@@ -3,6 +3,7 @@
 from .TS import *
 from .DQ import *
 from .seqARIMA import seqarima
+from .plot import message_verb
 from .Calc import *
 from .etc import Rist
 

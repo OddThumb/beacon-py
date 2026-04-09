@@ -1351,7 +1351,7 @@ def pipe(
         # If given current batch is NaN (by such as duty cycle issue)
         append_result_NaN(res_list)
         message_verb(
-            "WARNING: The current batch is NaN, might be due to the duty cycle", v=verb
+            "WARNING: The current batch is NaN, might be due to the duty cycle", verb=verb
         )
     else:
         arch = arch_params["arch"]

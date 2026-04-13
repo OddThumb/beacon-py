@@ -40,19 +40,19 @@ from .Calc import welch_window  # For Bandpass filter consistent with R version
 
 # ________________________________________________________________
 # Correct shifted phase by filter
-def zero_phasing(data: np.ndarray, coef: np.ndarray) -> np.ndarray:
+def zero_phasing(data: np.ndarray, H: np.ndarray) -> np.ndarray:
     """
     Apply zero-phase correction to filtered data.
 
     Corrects phase distortion from causal filters (diff, AR) by:
-        Y'(z) = Y(z) * e^{-iφ}  where φ = arg(A(z))
+        Y'(z) = Y(z) * e^{-iφ}  where φ = arg(H(z))
 
     This cancels the phase shift introduced by the filter while
-    preserving the magnitude response |A(z)|.
+    preserving the magnitude response |H(z)|.
 
     Args:
         data (np.ndarray): Filtered data (e.g., AR residuals).
-        coef (np.ndarray): Filter coefficients [1, -a_1, -a_2, ..., -a_p].
+        H (np.ndarray): Filter transfer function.
 
     Returns:
         np.ndarray: Phase-corrected data with same length as input.
@@ -60,12 +60,10 @@ def zero_phasing(data: np.ndarray, coef: np.ndarray) -> np.ndarray:
     from scipy.fft import fft, ifft
 
     data = np.asarray(data, dtype=np.float64)
-    coef = np.asarray(coef, dtype=np.float64)
     n = len(data)
 
-    # Phase response of A(z): φ = arg(A(z))
-    H_f = fft(coef, n=n)
-    phase = np.angle(H_f)
+    # Phase response of H(z): φ = arg(H(z))
+    phase = np.angle(H)
 
     # Apply phase correction: Y'(z) = Y(z) * e^{-iφ}
     X_f = fft(data, n=n)
@@ -199,7 +197,7 @@ def Differencing(
     ts_obj: ts,
     d: Union[int, str],
     t_seg: float = 0.5,
-    d_max: int = 2, 
+    d_max: int = 2,
     return_pvals: bool = False,
     verbose: bool = True,
 ) -> ts:
@@ -246,29 +244,13 @@ def Differencing(
         diff_ts = ts_obj
         d_order = 0
         meta = Rist(method=None, d_order=d_order)
-        
+
     else:
         raise ValueError("d must be 'auto', 0, or a positive integer.")
 
-    # Zero-phase correction and tail cropping (only if d > 0)
-    if d_order > 0:
-        coef = diff_coef(d_order)
-        diff_zp = zero_phasing(diff_ts.data, coef)
+    out_ts = diff_ts
 
-        # Crop tail d samples to remove zero_phasing edge artifact
-        diff_zp_cropped = diff_zp[:-d_order]
-
-        # Create output ts (start unchanged, end shortened by d)
-        out_ts = ts(
-            diff_zp_cropped,
-            start=diff_ts.start,
-            sampling_freq=diff_ts.sampling_freq,
-        )
-        meta["diff_coef"] = coef
-    else:
-        out_ts = diff_ts
-
-    # Inherit attributes and attach metadata
+    ## Inherit attributes and attach metadata
     inherit_ts_attrs(ts_obj, out_ts)
     setattr(out_ts, "diff_meta", meta)
 
@@ -408,7 +390,7 @@ def burgar(
     
         if ic_fun is None:
             raise ValueError(
-                f"Unknown ic: {ic}. Must be one of 'AIC', 'BIC', 'FPE',     'AICc', 'KIC', 'AKICc', or None"
+                f"Unknown ic: {ic}. Must be one of 'AIC', 'BIC', 'FPE', 'AICc', 'KIC', 'AKICc', or None"
             )
     
         xic = ic_fun(order_max, vars_pred, n_used, demean)
@@ -458,7 +440,7 @@ def burgar(
         }
     )
 
-def pred_resid(ts_obj, arcoef):
+def pred_resid(ts_obj, arcoef, zero_phase=False):
     """
     Predict AR residuals using fitted AR coefficients from other dataset.
     Internally, it also performs `zero_phasing()` as `sar()` does.
@@ -477,15 +459,24 @@ def pred_resid(ts_obj, arcoef):
     # Use mode="valid" to avoid boundary effects
     resid = np.convolve(data, a, mode="valid")
 
-    resid_zp = zero_phasing(resid, a)
+    # Zero-phase correction
+    if zero_phase:
+        trans_func = H_ar(
+            f=np.fft.fftfreq(n=len(resid), d=1 / ts_obj.sampling_freq),
+            fs=ts_obj.sampling_freq,
+            ar_coef=arcoef,
+        )
+        resid = zero_phasing(resid, trans_func)
+
     new_start = ts_obj.start + p_order / ts_obj.sampling_freq
 
-    return ts(resid_zp, start=new_start, sampling_freq=ts_obj.sampling_freq)
+    return ts(resid, start=new_start, sampling_freq=ts_obj.sampling_freq)
 
 def sar(
     ts_obj: ts,
     ic: str = "AIC",
     order_max: Optional[int] = None,
+    zero_phase: bool = False,
     **kwargs: Any,
 ) -> Rist:
     """
@@ -507,15 +498,23 @@ def sar(
             - ar_collector: Always "single" for SAR.
             - AR_obj: Full AR model result from `burgar()`.
     """
+    # Run Burg method AR
     ar_result = burgar(ts_obj.data, ic=ic, order_max=order_max, **kwargs)
     p = ar_result.order
     resid = ar_result.resid
 
     # Zero-phase correction
-    coef = np.r_[1, -ar_result.ar]
-    resid_zp = zero_phasing(resid, coef)
+    if zero_phase:
+        trans_func = H_ar(
+            f=np.fft.fftfreq(n=len(resid), d=1 / ts_obj.sampling_freq),
+            fs=ts_obj.sampling_freq,
+            ar_coef=ar_result.ar,
+        )
+        resid = zero_phasing(resid, trans_func)
+
+    # Re-arrange residual w.r.t. the lack of initial data
     new_start = ts_obj.start + p / ts_obj.sampling_freq
-    resid_ts = ts(resid_zp, start=new_start, sampling_freq=ts_obj.sampling_freq)
+    resid_ts = ts(resid, start=new_start, sampling_freq=ts_obj.sampling_freq)
 
     return Rist(
         resid=resid_ts,
@@ -534,6 +533,7 @@ def ear(
     ps: Sequence[int] = (100, 500, 1000),
     ic: Union[str, bool] = True,
     ar_collector: str = "median",
+    zero_phase: bool = False,
 ) -> Rist:
     """
     Fit multiple AR models (ensemble) and aggregate residuals.
@@ -552,14 +552,34 @@ def ear(
             - p_order: Selected AR orders.
             - ar_collector: Aggregation method used.
     """
-    ar_fits = [burgar(ts_obj.data, ic=ic, order_max=p) for p in ps]
-    orders = np.array([fit.order for fit in ar_fits])
+    ar_fits = [
+        burgar(ts_obj.data, ic=ic, order_max=p) for p in ps
+    ]  # Collect fitted ar obj
+    orders = np.array([fit.order for fit in ar_fits])  # Collect fitted orders
 
+    # Filter out only unique fittings
+    # e.g. order_max=10, 15: both may be fitted with order=9; They are duplicated
     unique_indices = np.unique(orders, return_index=True)[1]
     ar_fits = [ar_fits[i] for i in unique_indices]
     psel = orders[unique_indices]
 
+    # Collect residuals
     resids_list = [fit.resid for fit in ar_fits]
+    arcoef_list = [fit.ar for fit in ar_fits]
+    # Zero-phase correction
+    if zero_phase:
+        zp_list = []
+        for i in range(len(resids_list)):
+            resid = resids_list[i]
+            arcoef = arcoef_list[i]
+            trans_func = H_ar(
+                f=np.fft.fftfreq(n=len(resid), d=1 / ts_obj.sampling_freq),
+                fs=ts_obj.sampling_freq,
+                ar_coef=arcoef,
+            )
+            zp_list.append(zero_phasing(resid, trans_func))
+        resids_list = zp_list  # overwrite
+
     min_len = min(map(len, resids_list))
     resid_mat = np.stack([r[-min_len:] for r in resids_list], axis=1)
 
@@ -601,6 +621,7 @@ def Autoregressive(
     ic: str = "AIC",
     verbose: bool = True,
     ar_collector: str = "median",
+    zero_phase: bool = False,
     **kwargs: Any,
 ) -> ts:
     """
@@ -627,14 +648,14 @@ def Autoregressive(
             - 'ar_collector': Aggregation strategy used.
     """
     if isinstance(p, (list, tuple)) and len(p) > 1:
-        result = ear(ts_obj, ps=p, ic=ic, ar_collector=ar_collector, **kwargs)
+        result = ear(ts_obj, ps=p, ic=ic, ar_collector=ar_collector, zero_phase=zero_phase, **kwargs)
         message_verb(
             f"|> p={result.p_order} selected and aggregated by: {result.ar_collector}",
             verb=verbose,
         )
     else:
         p_single = p[0] if isinstance(p, (list, tuple)) else p
-        result = sar(ts_obj, ic=ic, order_max=p_single, **kwargs)
+        result = sar(ts_obj, ic=ic, order_max=p_single, zero_phase=zero_phase, **kwargs)
         message_verb(f"|> p={result.p_order} selected!", verb=verbose)
 
     resid = result.resid
@@ -1039,6 +1060,7 @@ def seqarima(
     ar_collector: str = "mean",
     ma_collector: str = "mean",
     ar_ic: str = "AIC",
+    zero_phase: bool = True,
     verbose: bool = True,
 ) -> ts:
     """
@@ -1071,7 +1093,24 @@ def seqarima(
 
     # Step 2: Autoregressive (required)
     message_verb("> (2) Autoregressive stage", verb=verbose)
-    out = Autoregressive(out, p=p, ic=ar_ic, verbose=verbose, ar_collector=ar_collector)
+    out = Autoregressive(
+        out, p=p, ic=ar_ic, zero_phase=False, verbose=verbose, ar_collector=ar_collector
+    )
+
+    # Zero phase correction for Diff + AR together
+    if zero_phase:
+        is_ear = out.ar_meta.ar_collector != "single"
+        if is_ear:
+            warnings.warn("Zero-phase correction is not supported for ensemble AR. Skipping.")
+        else:
+            f = np.fft.fftfreq(n=out.length, d=1 / ts_obj.sampling_freq)
+            H_out = np.ones_like(f, dtype=complex)
+            if hasattr(out, "diff_meta") and out.diff_meta is not None:
+                H_out *= H_diff(f, ts_obj.sampling_freq, out.diff_meta.d_order)
+            H_out *= H_ar(f, ts_obj.sampling_freq, out.ar_meta.ar_coef)
+            out_zp = tsref(zero_phasing(out.data, H_out), out)
+            inherit_ts_attrs(out, out_zp)
+            out = out_zp
 
     # Step 3: Moving Average (optional)
     if q: #q is not None:
@@ -1110,6 +1149,8 @@ def extract_seqarima_params(seqarima_obj) -> Rist:
         fs=seqarima_obj.sampling_freq,
         ar_coef=seqarima_obj.ar_meta.ar_coef,
         var_pred=seqarima_obj.ar_meta.var_pred,
+        parcor=seqarima_obj.ar_meta.parcor,
+        ar_collector=seqarima_obj.ar_meta.ar_collector,
     )
 
     # Differencing (optional)
@@ -1155,7 +1196,7 @@ def H_diff(f: np.ndarray, fs: float, d: int = 1) -> np.ndarray:
         Complex transfer function H(f)
     """
     f = np.asarray(f)
-    return (1 - np.exp(-1j * 2 * np.pi * f / fs)) ** d
+    return (1 - np.exp(-1j * 2 * np.pi * f / fs)) ** d # same expression with using freqz()
 
 
 def H_ar(f: np.ndarray, fs: float, ar_coef: np.ndarray) -> np.ndarray:
@@ -1411,6 +1452,7 @@ def envelope_snr(seqarima_obj) -> np.ndarray:
 def pred_seqarima(
     ts_obj: ts,
     params: Rist,
+    zero_phase: bool = True,
     verbose: bool = True,
 ) -> ts:
     """
@@ -1461,6 +1503,30 @@ def pred_seqarima(
     ar_coef = params.ar_coef
     message_verb(f"> (2) AR filtering: p={len(ar_coef)}", verb=verbose)
     out = pred_resid(out, arcoef=ar_coef)
+
+    # Insert ar_meta
+    setattr(out, "ar_meta", Rist(
+        ar_coef=params.ar_coef,
+        var_pred=params.var_pred,
+        parcor=params.parcor,
+        p_order=len(ar_coef) if isinstance(ar_coef, np.ndarray) else [len(v) for v in ar_coef.values()],
+        ar_collector=params.ar_collector,
+    ))
+    
+    # Zero-phase correction for Diff + AR together
+    if zero_phase:
+        is_ear = out.ar_meta.ar_collector != "single"
+        if is_ear:
+            warnings.warn("Zero-phase correction is not supported for ensemble AR. Skipping.")
+        else:
+            f = np.fft.fftfreq(n=out.length, d=1 / ts_obj.sampling_freq)
+            H_out = np.ones_like(f, dtype=complex)
+            if hasattr(out, "diff_meta") and out.diff_meta is not None:
+                H_out *= H_diff(f, ts_obj.sampling_freq, out.diff_meta.d_order)
+            H_out *= H_ar(f, ts_obj.sampling_freq, out.ar_meta.ar_coef)
+            out_zp = tsref(zero_phasing(out.data, H_out), out)
+            inherit_ts_attrs(out, out_zp)
+            out = out_zp
 
     # Step 3: Moving Average (optional)
     if has_param(params, "q_list"):

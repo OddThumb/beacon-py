@@ -472,8 +472,11 @@ def plot_anomaly(
     p_crit: float = 0.05,
     p_col: str | None = "P0",
     title: str = "Anomaly Plot",
+    xlabel: str = None,
+    ylabel: str = None,
     figsize: tuple[float, float] = (8, 3),
     lw: float = 0.5,
+    ax=None,
 ) -> None:
     """
     Plot anomaly results with oscillogram-style formatting (polars-only).
@@ -503,7 +506,11 @@ def plot_anomaly(
         y_lwr = anom_df.get_column(err_lwr).to_numpy()
         y_upr = anom_df.get_column(err_upr).to_numpy()
 
-    fig, ax = plt.subplots(figsize=figsize)
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+        is_standalone = True
+    else:
+        is_standalone = False
 
     if has_ribbon:
         ax.fill_between(
@@ -560,7 +567,6 @@ def plot_anomaly(
                 linewidths=1,
             )
 
-    ax.set_xlabel(r"Time$ - t_0$ (s)")
     if time_shifted.size > 0:
         ax.set_xlim(time_shifted[0], time_shifted[-1])
     ax.xaxis.set_major_locator(MaxNLocator(10))
@@ -571,14 +577,25 @@ def plot_anomaly(
 
     ax.yaxis.set_major_locator(MaxNLocator(5))
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v / scale_factor:.1f}"))
-    ax.set_ylabel(f"$h~(10^{{{value_order}}})$" if value_order != 0 else r"$h$")
+
+    if xlabel is None:
+        xlabel = r"Time$ - t_0$ (s)"
+    if ylabel is None:
+        ylabel = f"$h~(10^{{{value_order}}})$" if value_order != 0 else r"$h$"
+    else:
+        ylabel = f"{ylabel} $(10^{{{value_order}}})$" if value_order != 0 else r"$h$"
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
 
     if title:
         ax.set_title(title)
 
     ax.grid(True, which="both", ls="--", alpha=0.3)
     plt.tight_layout()
-    plt.show()
+
+    if is_standalone:
+        plt.show()
 
 
 def plot_lambda(
@@ -633,6 +650,7 @@ def plot_lambda(
     ax.legend(title="Detector", loc="upper right")
     plt.tight_layout()
     plt.show()
+    return fig
 
 
 def plot_coinc(

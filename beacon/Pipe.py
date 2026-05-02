@@ -380,45 +380,65 @@ def run_dbscan(
     min_samples: int = 1,
     time_col: str = "time",
     anomaly_col: str = "anomaly",
+    mask=None,
 ) -> pl.DataFrame:
     """
-    Run DBSCAN clustering on time values where anomaly == 1.
+    Run DBSCAN clustering on time values where anomaly conditions are met.
 
     Args:
-        anom_df (pl.DataFrame): Anomaly detection result.
-        eps (float): DBSCAN epsilon (distance threshold, e.g., 1/fs).
-        min_samples (int): Minimum samples per cluster.
-        time_col (str): Column containing time values.
-        anomaly_col (str): Column indicating anomaly (1 = true anomaly).
+        anom_df (pl.DataFrame): Input dataframe containing anomaly detection results.
+        eps (float): The maximum distance between two samples for one to be considered as in the neighborhood of the other.
+        min_samples (int): The number of samples in a neighborhood for a point to be considered as a core point.
+        time_col (str): Column name for time values.
+        anomaly_col (str): Column name indicating anomalies.
+        mask (pl.Expr, optional): Custom boolean mask for filtering. Defaults to None.
 
     Returns:
-        pl.DataFrame: Input DataFrame with added 'cluster' column (null if not clustered).
+        pl.DataFrame: Original dataframe with an added 'cluster' column.
     """
-    df = anom_df
-    mask = df[anomaly_col] == 1
-    times = df.filter(mask)[time_col].to_numpy().reshape(-1, 1)
+    # Create a unique ID for each row to safely join clustering results back later
+    df = anom_df.with_row_index("__id__")
 
-    # Run DBSCAN on time values
-    if len(times) == 0:
-        labels = np.array([], dtype=int)
-    else:
-        db = DBSCAN(eps=eps, min_samples=min_samples, metric="euclidean")
-        labels = db.fit_predict(times)
-        labels = np.where(labels >= 0, labels + 1, -1)  # Shift to start from 1
+    # 1. Determine the logical mask for filtering anomalies
+    if mask is None:
+        if time_col == "time" and anomaly_col == "anomaly":
+            mask = pl.col(anomaly_col) == 1
+        elif time_col == "time_bin" and anomaly_col == "S":
+            # P0_thresh and significance calculation logic for specific case
+            p0_thresh = 0.05
+            mask = pl.col(anomaly_col) > Significance(p0_thresh, a=1)
+        else:
+            # Raise error if no predefined mask matches the given column combination
+            raise ValueError(
+                f"No default mask for time_col='{time_col}' and anomaly_col='{anomaly_col}'. "
+                "You must provide a 'mask' argument for this combination."
+            )
 
-    # Initialize cluster column with None
-    cluster_full = np.empty(len(df), dtype=object)
-    cluster_full[:] = None
-    anomaly_indices = np.where(mask)[0]
+    # 2. Extract only the rows that meet the anomaly criteria
+    target_data = df.filter(mask).select(["__id__", time_col])
 
-    if labels.size:
-        pos = labels > 0
-        cluster_full[anomaly_indices[pos]] = labels[pos].astype(int)
+    # If no anomalies found, return the dataframe with an empty 'cluster' column
+    if target_data.is_empty():
+        return anom_df.with_columns(pl.lit(None).cast(pl.Int64).alias("cluster"))
 
-    # Add 'cluster' column
-    return df.with_columns(
-        pl.Series("cluster", cluster_full.tolist()).cast(pl.Int64, strict=False)
-    )
+    # 3. Run DBSCAN on the filtered time values
+    times = target_data[time_col].to_numpy().reshape(-1, 1)
+    t_ref = times.min()
+    times_rel = times - t_ref
+
+    db = DBSCAN(eps=eps, min_samples=min_samples, metric="euclidean")
+    labels = db.fit_predict(times_rel)
+
+    # Convert noise label (-1) to None and adjust cluster IDs to start from 1
+    processed_labels = [int(l) + 1 if l >= 0 else None for l in labels]
+
+    # 4. Map the cluster labels back to the original dataframe using the temporary ID
+    cluster_mapping = target_data.with_columns(
+        pl.Series("cluster", processed_labels).cast(pl.Int64)
+    ).select(["__id__", "cluster"])
+
+    # Perform a left join to append the 'cluster' column and drop the temporary ID
+    return df.join(cluster_mapping, on="__id__", how="left").drop("__id__")
 
 
 def arch(ts_obj: ts, params: Rist) -> pl.DataFrame:

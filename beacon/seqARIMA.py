@@ -1396,7 +1396,12 @@ def var_seqarima(
         return var_pred * (2 / fs) * integral
     else:  # "freq"
         # Frequency-domain: normalized by bandwidth
-        bw = (params.fu - params.fl) if has_param(params, "fl") else (fs / 2)
+        fl, fu = params.fl, params.fu
+        if fu is None:
+            fu=fs/2
+        if fl is None:
+            fl=0
+        bw = fu - fl
         return var_pred * integral / bw / (fs / 2)
 
 

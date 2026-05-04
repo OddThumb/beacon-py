@@ -1402,7 +1402,7 @@ def var_seqarima(
         if fl is None:
             fl=0
         bw = fu - fl
-        return var_pred * integral / bw / (fs / 2)
+        return var_pred * (2 / fs) * integral / bw
 
 
 def psd_seqarima(f: np.ndarray, params: Rist) -> np.ndarray:
@@ -1452,8 +1452,8 @@ def envelope_snr(seqarima_obj) -> np.ndarray:
         ts: SNR time series with variance_result attribute.
     """
     params = extract_seqarima_params(seqarima_obj)
-    freqs = np.fft.rfftfreq(seqarima_obj.length)
-    sigma2 = var_seqarima(f=freqs, params=params)
+    freqs = np.fft.rfftfreq(seqarima_obj.length, 1 / seqarima_obj.sampling_freq)
+    sigma2 = var_seqarima(f=freqs, params=params, domain="time")
 
     analytic_signal = hilbert(seqarima_obj.data)
     envelope = np.abs(analytic_signal)

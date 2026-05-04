@@ -1293,11 +1293,24 @@ def H_bp(
     nyq = fs / 2
     numtaps = order + 1
 
+    # Determine filter type and its cutoff
+    if fl is not None and fu is not None:
+        ftype = "bandpass"
+        cutoff = [fl / nyq, fu / nyq]
+    elif fl is not None:
+        ftype = "highpass"
+        cutoff = fl / nyq
+    elif fu is not None:
+        ftype = "lowpass"
+        cutoff = fu / nyq
+    else:
+        raise ValueError("At least one of fl or fu must be specified.")
+
     filt = firwin(
         numtaps=numtaps,
-        cutoff=[fl / nyq, fu / nyq],
-        pass_zero="bandpass",
-        window="boxcar",
+        cutoff=cutoff,
+        pass_zero=ftype,
+        window="boxcar", # for welch tapering
     )
     filt = filt * welch_window(numtaps)
 

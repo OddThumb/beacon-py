@@ -83,6 +83,48 @@ def diff_coef(d: int) -> np.ndarray:
         coef = np.convolve(coef, [1, -1])
     return coef
 
+
+# ===========================================================
+# Fractional Differencing: (1-B)^d
+#
+# Weight recursion: w_0=1, w_k = w_{k-1} * (-(d-k+1)/k)
+# For d>1: decompose as (1-B)^floor(d) * (1-B)^frac(d)
+#   → integer part is exact (np.diff)
+#   → fractional part (0 < d_frac < 1) has decaying weights
+#
+# Ref: Hosking (1981) Biometrika 68(1), 165-176
+#      Lopez de Prado (2018) AFML, Ch.5
+# ===========================================================
+def frac_diff_coefs(d, window, thresh=1e-8):
+    """Fractional differencing weights via recursion.
+    For integer d, reproduces exact binomial coefficients."""
+    w = [1.0]
+    for k in range(1, window):
+        w_k = w[-1] * (-(d - k + 1) / k)
+        if abs(w_k) < thresh and k > max(20, int(d) + 5):
+            break
+        w.append(w_k)
+    return np.array(w)
+
+def frac_diff(x, d, window=1024):
+    """Apply (1-B)^d to series x.
+    For d > 1: decomposes into integer + fractional parts."""
+    d_int = int(np.floor(d))
+    d_frac = d - d_int
+
+    # Integer part: exact via np.diff
+    y = x.copy()
+    if d_int > 0:
+        y = np.diff(y, n=d_int)
+
+    # Fractional part: FIR filter
+    if abs(d_frac) > 1e-10:
+        w = frac_diff_coefs(d_frac, window)
+        W = len(w)
+        y_filt = np.convolve(y, w, mode="full")[: len(y)]
+        return y_filt[W - 1 :]  # trim initial transient
+    return y
+
 # Split time series into segments and run KPSS tests for stationarity
 def check_stationary(ts_obj: ts, t_seg: float = 0.5) -> pd.DataFrame:
     """
@@ -142,7 +184,11 @@ def check_stationary(ts_obj: ts, t_seg: float = 0.5) -> pd.DataFrame:
 
 # Automatically determine differencing order to achieve stationarity
 def auto_diff(
-    ts_obj: ts, t_seg: float = 0.5, d_max: int = 2, verbose: bool = True
+    ts_obj: ts,
+    t_seg: float = 0.5,
+    d_max: float = 2.0,
+    frac: bool = False,
+    verbose: bool = True,
 ) -> Rist:
     """
     Automatically determine the differencing order required for stationarity by KPSS test.
@@ -150,7 +196,8 @@ def auto_diff(
     Args:
         ts_obj (ts): Time series object.
         t_seg (float, optional): Segment duration in seconds for stationarity testing. Defaults to 0.5.
-        d_max (int, optional): Maximum differencing order. Defaults to 2.
+        d_max (float, optional): Maximum differencing order. Defaults to 2.
+        frac (bool): Allow fractional differencing?
         verbose (bool, optional): If True, print progress messages. Defaults to True.
 
     Returns:
@@ -159,45 +206,81 @@ def auto_diff(
             - 'out': Differenced time series object.
             - 'p_values': History of p-values per differencing iteration.
     """
-    d = 0
-    out_data = ts_obj.data.copy()
+    d_int = 0
     pval_history = Rist()
 
-    message_verb(f"|> KPSS test on segments (each {t_seg} second)", verb=verbose)
-    message_verb(f"||> d={d}", verb=verbose)
+    message_verb(f"|> Phase 1: Finding integer differencing order", verb=verbose)
 
-    pvals_df = check_stationary(ts_obj, t_seg)
-    pval_history[f"d{d}"] = pvals_df
+    # --- Phase 1: Find the first integer d that achieves stationarity ---
+    current_data = ts_obj.data.copy()
+    while d_int <= d_max:
+        message_verb(f"||> Testing integer d={d_int}", verb=verbose)
 
-    while not ((pvals_df >= 0.1).all().all()):
-        message_verb(
-            "|||> Non-stationary segment detected (p-value < 0.1)", verb=verbose
+        ts_temp = ts(
+            current_data, start=ts_obj.start, sampling_freq=ts_obj.sampling_freq
         )
-        d += 1
-        out_data = np.diff(out_data, n=1)
-        message_verb(f"||> d={d}", verb=verbose)
+        pvals_df = check_stationary(ts_temp, t_seg)
+        pval_history[f"d{d_int}.0"] = pvals_df
 
-        ts_diff = ts(out_data, start=ts_obj.start, sampling_freq=ts_obj.sampling_freq)
-        pvals_df = check_stationary(ts_diff, t_seg)
-        pval_history[f"d{d}"] = pvals_df
-
-        if d_max is not None and d >= d_max:
+        if (pvals_df >= 0.1).all().all():
+            message_verb(f"|||> Stationary at integer d={d_int}", verb=verbose)
             break
 
+        if d_int >= d_max:
+            message_verb(f"||! Reached d_max={d_max}", verb=verbose)
+            break
+
+        d_int += 1
+        current_data = np.diff(ts_obj.data, n=d_int)
+
+    final_d = float(d_int)
+    final_data = current_data
+
+    # --- Phase 2: Refine with fractional differencing if requested ---
+    # Only refine if d_int > 0 and the series became stationary at d_int
+    if frac and d_int > 0 and (pvals_df >= 0.1).all().all():
+        message_verb(
+            f"|> Phase 2: Refining with fractional orders in (d={d_int - 1}, d={d_int})",
+            verb=verbose,
+        )
+
+        # Search from d_int - 0.9 to d_int - 0.1
+        for f_step in range(1, 10):
+            d_frac = round((d_int - 1) + (f_step * 0.1), 1)
+            message_verb(f"||> Testing fractional d={d_frac}", verb=verbose)
+
+            frac_data = frac_diff(ts_obj.data, d_frac)
+            ts_temp = ts(
+                frac_data, start=ts_obj.start, sampling_freq=ts_obj.sampling_freq
+            )
+            pvals_df = check_stationary(ts_temp, t_seg)
+            pval_history[f"d{d_frac}"] = pvals_df
+
+            if (pvals_df >= 0.1).all().all():
+                message_verb(
+                    f"|||> Optimal fractional d found at {d_frac}", verb=verbose
+                )
+                final_d = d_frac
+                final_data = frac_data
+                break
+
+    # Adjust start time based on the number of samples lost
+    shift_n = len(ts_obj.data) - len(final_data)
     out_ts = ts(
-        out_data,
-        start=ts_obj.start + d * (1 / ts_obj.sampling_freq),
+        final_data,
+        start=ts_obj.start + shift_n * (1 / ts_obj.sampling_freq),
         sampling_freq=ts_obj.sampling_freq,
     )
-    return Rist({"d": d, "out": out_ts, "p_values": pval_history})
 
+    return Rist({"d": final_d, "out": out_ts, "p_values": pval_history})
 
 # High-level wrapper to apply differencing manually or via KPSS-based auto differencing
 def Differencing(
     ts_obj: ts,
-    d: Union[int, str],
+    d: Union[int, float, str],
     t_seg: float = 0.5,
-    d_max: int = 2,
+    d_max: float = 2.0, # Changed to float to support fractional d_max
+    frac: bool = False,
     return_pvals: bool = False,
     verbose: bool = True,
 ) -> ts:
@@ -206,55 +289,70 @@ def Differencing(
 
     Args:
         ts_obj (ts): Input time series object.
-        d (int or 'auto'): Differencing strategy.
+        d (int or float or 'auto'): Differencing strategy.
             - 'auto': perform KPSS-based auto-differencing
             - int > 0: apply fixed-order differencing
             - 0: no differencing
         t_seg (float): Segment length (in seconds) for KPSS test (used only if d='auto')
+        d_max (float): Maximum d to search in 'auto' mode.
+        frac (bool): Allow fractional differencing?
         return_pvals (bool): Include KPSS p-values in output metadata (only if d='auto')
         verbose (bool): Print progress messages
 
     Returns:
         ts: Differenced time series object with `.diff_meta` attribute (Rist)
     """
-
+    # 1. Determine the Strategy
     if d == "auto":
-        # KPSS-based auto differencing
-        diff_res = auto_diff(ts_obj, t_seg=t_seg, d_max=d_max, verbose=verbose)
-        message_verb(f"|> d={diff_res['d']} selected!", verb=verbose)
-        diff_ts = diff_res.out
-        d_order = diff_res.d
-        meta = Rist(method="auto", d_order=d_order, unbounded=True)
-        if return_pvals:
-            meta["p_values"] = diff_res.p_values
+        # Automated search (Integer or Fractional based on 'frac' flag)
+        diff_res = auto_diff(ts_obj, t_seg=t_seg, d_max=d_max, frac=frac, verbose=verbose)
+        d_order, out_data = diff_res['d'], diff_res['out'].data
+        method = "auto_frac" if frac else "auto_int"
+        p_values = diff_res.p_values if return_pvals else None
 
-    elif isinstance(d, int) and d > 0:
-        # Fixed differencing of order d
-        out_data = np.diff(ts_obj.data, n=d)
-        diff_ts = ts(
-            out_data,
-            start=ts_obj.start + d * (1 / ts_obj.sampling_freq),
-            sampling_freq=ts_obj.sampling_freq,
-        )
+    elif isinstance(d, (int, float)):
+        # Fixed order differencing
         d_order = d
-        meta = Rist(method="fixed", d_order=d_order)
-
-    elif d == 0:
-        # Explicit no differencing
-        diff_ts = ts_obj
-        d_order = 0
-        meta = Rist(method=None, d_order=d_order)
-
+        method = "fixed_frac" if isinstance(d, float) or frac else "fixed_int"
+        p_values = None
+        
+        if d == 0:
+            out_data = ts_obj.data.copy()
+        elif isinstance(d, int) and not frac:
+            out_data = np.diff(ts_obj.data, n=d)
+        else:
+            # Covers float d or int d with frac=True
+            out_data = frac_diff(ts_obj.data, d)
     else:
-        raise ValueError("d must be 'auto', 0, or a positive integer.")
+        raise ValueError("d must be 'auto' or a numeric value (int/float).")
 
-    out_ts = diff_ts
+    # 2. Construct the Output Object
+    # Calculate samples lost to adjust start time
+    shift_n = len(ts_obj.data) - len(out_data)
+    out_ts = ts(
+        out_data,
+        start=ts_obj.start + shift_n * (1 / ts_obj.sampling_freq),
+        sampling_freq=ts_obj.sampling_freq,
+    )
 
-    ## Inherit attributes and attach metadata
+    # 3. Metadata Attachment
+    meta = Rist(
+        method=method, 
+        d_order=d_order, 
+        is_frac=(d_order % 1 != 0), # True if there is a fractional part
+        unbounded=(d == "auto")
+    )
+    if p_values is not None:
+        meta["p_values"] = p_values
+
     inherit_ts_attrs(ts_obj, out_ts)
     setattr(out_ts, "diff_meta", meta)
 
+    if verbose:
+        message_verb(f"|> Differencing applied: method={method}, d={d_order}", verb=verbose)
+
     return out_ts
+
 
 
 # ________________________________________________________________
@@ -1051,12 +1149,13 @@ def BandPass(
 def seqarima(
     ts_obj: ts,
     p: Union[int, Sequence[int]],
-    d: Union[int, str, None] = None,
+    d: Union[int, float, str, None] = None,
     q: Union[int, Sequence[int], None] = None,
     fl: Optional[float] = None,
     fu: Optional[float] = None,
     diff_max: int = 2,
     diff_tseg: float = 0.5,
+    diff_frac: bool = False,
     ar_collector: str = "mean",
     ma_collector: str = "mean",
     ar_ic: str = "AIC",
@@ -1089,7 +1188,9 @@ def seqarima(
     # Step 1: Differencing (optional)
     if d is not None:
         message_verb("> (1) Difference stage", verb=verbose)
-        out = Differencing(out, d=d, t_seg=diff_tseg, d_max=diff_max, verbose=verbose)
+        out = Differencing(
+            out, d=d, t_seg=diff_tseg, frac=diff_frac, d_max=diff_max, verbose=verbose
+        )
 
     # Step 2: Autoregressive (required)
     message_verb("> (2) Autoregressive stage", verb=verbose)
@@ -1156,6 +1257,7 @@ def extract_seqarima_params(seqarima_obj) -> Rist:
     # Differencing (optional)
     if hasattr(seqarima_obj, "diff_meta") and seqarima_obj.diff_meta is not None:
         params["d"] = seqarima_obj.diff_meta.d_order
+        params["diff_frac"] = seqarima_obj.diff_meta.is_frac
 
     # EoA (optional)
     if hasattr(seqarima_obj, "ma_meta") and seqarima_obj.ma_meta is not None:
@@ -1181,7 +1283,7 @@ def has_param(params: Rist, key: str) -> bool:
 # Pipeline: Differencing -> AR filtering -> EoA -> BP filter (filtfilt) -> x_out
 
 
-def H_diff(f: np.ndarray, fs: float, d: int = 1) -> np.ndarray:
+def H_diff(f: np.ndarray, fs: float, d: float = 1) -> np.ndarray:
     """
     Transfer function for d-th order differencing filter.
 
@@ -1512,7 +1614,7 @@ def pred_seqarima(
     # Step 1: Differencing (optional)
     if has_param(params, "d") and params.d > 0:
         message_verb(f"> (1) Differencing: d={params.d}", verb=verbose)
-        out = Differencing(out, d=params.d, verbose=False)
+        out = Differencing(out, d=params.d, frac=params.diff_frac, verbose=False)
 
     # Step 2: AR filtering (required)
     if not has_param(params, "ar_coef"):

@@ -107,23 +107,35 @@ def frac_diff_coefs(d, window, thresh=1e-8):
     return np.array(w)
 
 def frac_diff(x, d, window=1024):
-    """Apply (1-B)^d to series x.
-    For d > 1: decomposes into integer + fractional parts."""
-    d_int = int(np.floor(d))
-    d_frac = d - d_int
+    """(1-B)^d via frequency domain with linear convolution (zero-padded)."""
+    if d == 0:
+        return x.copy()
+    n = len(x)
+    n_fft = n + window - 1
+    X = np.fft.rfft(x, n=n_fft)
+    freqs = np.fft.rfftfreq(n_fft)
+    H = (1 - np.exp(-1j * 2 * np.pi * freqs)) ** d
+    out = np.fft.irfft(X * H, n=n_fft)
+    return out[:n]
 
-    # Integer part: exact via np.diff
-    y = x.copy()
-    if d_int > 0:
-        y = np.diff(y, n=d_int)
-
-    # Fractional part: FIR filter
-    if abs(d_frac) > 1e-10:
-        w = frac_diff_coefs(d_frac, window)
-        W = len(w)
-        y_filt = np.convolve(y, w, mode="full")[: len(y)]
-        return y_filt[W - 1 :]  # trim initial transient
-    return y
+#def frac_diff(x, d, window=1024):
+#    """Apply (1-B)^d to series x.
+#    For d > 1: decomposes into integer + fractional parts."""
+#    d_int = int(np.floor(d))
+#    d_frac = d - d_int
+#
+#    # Integer part: exact via np.diff
+#    y = x.copy()
+#    if d_int > 0:
+#        y = np.diff(y, n=d_int)
+#
+#    # Fractional part: FIR filter
+#    if abs(d_frac) > 1e-10:
+#        w = frac_diff_coefs(d_frac, window)
+#        W = len(w)
+#        y_filt = np.convolve(y, w, mode="full")[: len(y)]
+#        return y_filt[W - 1 :]  # trim initial transient
+#    return y
 
 # Split time series into segments and run KPSS tests for stationarity
 def check_stationary(ts_obj: ts, t_seg: float = 0.5) -> pd.DataFrame:

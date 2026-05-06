@@ -96,8 +96,7 @@ def diff_coef(d: int) -> np.ndarray:
 #      Lopez de Prado (2018) AFML, Ch.5
 # ===========================================================
 def frac_diff_coefs(d, window, thresh=1e-8):
-    """Fractional differencing weights via recursion.
-    For integer d, reproduces exact binomial coefficients."""
+    """Fractional differencing weights via recursion."""
     w = [1.0]
     for k in range(1, window):
         w_k = w[-1] * (-(d - k + 1) / k)
@@ -106,24 +105,29 @@ def frac_diff_coefs(d, window, thresh=1e-8):
         w.append(w_k)
     return np.array(w)
 
+
 def frac_diff(x, d, window=1024):
-    """Apply (1-B)^d to series x.
-    For d > 1: decomposes into integer + fractional parts."""
+    """
+    Apply (1-B)^d to series x using mode='valid' to avoid time-shift ambiguity.
+    """
     d_int = int(np.floor(d))
     d_frac = d - d_int
 
-    # Integer part: exact via np.diff
+    # 1. Integer part
     y = x.copy()
     if d_int > 0:
         y = np.diff(y, n=d_int)
 
-    # Fractional part: FIR filter
+    # 2. Fractional part
     if abs(d_frac) > 1e-10:
         w = frac_diff_coefs(d_frac, window)
-        W = len(w)
-        y_filt = np.convolve(y, w, mode="full")[: len(y)]
-        return y_filt[W - 1 :]  # trim initial transient
+        # mode='valid' ensures no padding artifacts
+        # Result length: len(y) - len(w) + 1
+        y_filt = np.convolve(y, w, mode="valid")
+        return y_filt
+
     return y
+
 
 # Split time series into segments and run KPSS tests for stationarity
 def check_stationary(ts_obj: ts, t_seg: float = 0.5) -> pd.DataFrame:

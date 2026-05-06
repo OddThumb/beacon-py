@@ -96,7 +96,8 @@ def diff_coef(d: int) -> np.ndarray:
 #      Lopez de Prado (2018) AFML, Ch.5
 # ===========================================================
 def frac_diff_coefs(d, window, thresh=1e-8):
-    """Fractional differencing weights via recursion."""
+    """Fractional differencing weights via recursion.
+    For integer d, reproduces exact binomial coefficients."""
     w = [1.0]
     for k in range(1, window):
         w_k = w[-1] * (-(d - k + 1) / k)
@@ -105,37 +106,24 @@ def frac_diff_coefs(d, window, thresh=1e-8):
         w.append(w_k)
     return np.array(w)
 
-
-def frac_diff(x, d):
-    """
-    Standard Time-domain Fractional Differencing (Grünwald-Letnikov).
-    This implementation follows the logic of standard packages to maintain
-    alignment with integer differencing (np.diff).
-    """
-    n = len(x)
-    if d == 0:
-        return x
-
-    # 1. Prepare weights (w_k) via recursion
-    # This is equivalent to the expansion of (1-B)^d
-    w = np.zeros(n)
-    w[0] = 1.0
-    for k in range(1, n):
-        w[k] = w[k - 1] * (k - 1 - d) / k
-
-    # 2. Apply differencing using the full history for each point
-    # To keep it consistent with np.diff(n=1) which loses 1 sample,
-    # we ensure the output reflects the same sample loss logic.
-    res = np.zeros(n)
-    for i in range(n):
-        # res[i] = w[0]*x[i] + w[1]*x[i-1] + ... + w[i]*x[0]
-        res[i] = np.dot(w[: i + 1], x[i::-1])
-
-    # For d=1.3, we expect to behave like d_int=1.
-    # To match your framework's 'shift_n' logic:
+def frac_diff(x, d, window=1024):
+    """Apply (1-B)^d to series x.
+    For d > 1: decomposes into integer + fractional parts."""
     d_int = int(np.floor(d))
-    return res[d_int:]
+    d_frac = d - d_int
 
+    # Integer part: exact via np.diff
+    y = x.copy()
+    if d_int > 0:
+        y = np.diff(y, n=d_int)
+
+    # Fractional part: FIR filter
+    if abs(d_frac) > 1e-10:
+        w = frac_diff_coefs(d_frac, window)
+        W = len(w)
+        y_filt = np.convolve(y, w, mode="full")[: len(y)]
+        return y_filt[W - 1 :]  # trim initial transient
+    return y
 
 # Split time series into segments and run KPSS tests for stationarity
 def check_stationary(ts_obj: ts, t_seg: float = 0.5) -> pd.DataFrame:

@@ -106,27 +106,35 @@ def frac_diff_coefs(d, window, thresh=1e-8):
     return np.array(w)
 
 
-def frac_diff(x, d, window=1024):
+def frac_diff(x, d):
     """
-    Apply (1-B)^d to series x using mode='valid' to avoid time-shift ambiguity.
+    Standard Time-domain Fractional Differencing (Grünwald-Letnikov).
+    This implementation follows the logic of standard packages to maintain
+    alignment with integer differencing (np.diff).
     """
+    n = len(x)
+    if d == 0:
+        return x
+
+    # 1. Prepare weights (w_k) via recursion
+    # This is equivalent to the expansion of (1-B)^d
+    w = np.zeros(n)
+    w[0] = 1.0
+    for k in range(1, n):
+        w[k] = w[k - 1] * (k - 1 - d) / k
+
+    # 2. Apply differencing using the full history for each point
+    # To keep it consistent with np.diff(n=1) which loses 1 sample,
+    # we ensure the output reflects the same sample loss logic.
+    res = np.zeros(n)
+    for i in range(n):
+        # res[i] = w[0]*x[i] + w[1]*x[i-1] + ... + w[i]*x[0]
+        res[i] = np.dot(w[: i + 1], x[i::-1])
+
+    # For d=1.3, we expect to behave like d_int=1.
+    # To match your framework's 'shift_n' logic:
     d_int = int(np.floor(d))
-    d_frac = d - d_int
-
-    # 1. Integer part
-    y = x.copy()
-    if d_int > 0:
-        y = np.diff(y, n=d_int)
-
-    # 2. Fractional part
-    if abs(d_frac) > 1e-10:
-        w = frac_diff_coefs(d_frac, window)
-        # mode='valid' ensures no padding artifacts
-        # Result length: len(y) - len(w) + 1
-        y_filt = np.convolve(y, w, mode="valid")
-        return y_filt
-
-    return y
+    return res[d_int:]
 
 
 # Split time series into segments and run KPSS tests for stationarity

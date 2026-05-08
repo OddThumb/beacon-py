@@ -658,9 +658,8 @@ def plot_coinc(
     *,
     tzero: Optional[float] = None,
     p_crit: float = 0.05,
-    a: float = 2.3,  # e.g., b1p1k=2.3, b8p4k=1.6
+    a: float = 1,
     alpha_det: float = 0.3,
-    legend_position: str = "tr",  # one of {"tr","tl","br","bl"}
     annotate_vals: bool = False,
     annotate_thresh: Optional[float] = None,
     time_col: str = "time_bin",
@@ -685,8 +684,6 @@ def plot_coinc(
         Scaling factor for Significance.
     alpha_det : float
         Transparency for single-detector series.
-    legend_position : {"tr","tl","br","bl"}
-        Legend corner inside the axes.
     annotate_vals : bool
         If True, annotate points exceeding the annotation threshold.
     annotate_thresh : float, optional
@@ -754,12 +751,6 @@ def plot_coinc(
         "P0_net": "-",
         "P0_H1_bin": "--",
         "P0_L1_bin": "--",
-    }
-    loc_map = {
-        "tr": "upper right",
-        "tl": "upper left",
-        "br": "lower right",
-        "bl": "lower left",
     }
 
     # --- Create axes ---
@@ -838,7 +829,7 @@ def plot_coinc(
     # --- Labels, legend, grid ---
     ax.set_xlabel(f"Time (s) from {tzero}")
     ax.set_ylabel(r"$\mathcal{S}$")
-    ax.legend(loc=loc_map.get(legend_position, "upper right"), frameon=True)
+    ax.legend(loc='best', frameon=True)
     ax.grid(True, alpha=0.3)
     ax.set_axisbelow(True)
 

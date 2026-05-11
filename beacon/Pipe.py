@@ -602,28 +602,38 @@ def config_pipe(replace: Optional[Rist] = None, show_config: bool = True) -> Ris
         arch=arch,
         DQ="BURST_CAT2",
         n_workers=None,  # Defulat is None, this will be handled inside pipe_net()
-        # seqARIMA
+
+        # _____Denoising(seqARIMA)_____
         d="auto",
         d_max=2,
         p=1024,
         q=range(1, 21),
         fl=32,
         fu=512,
-        # Anomaly Detection
+
+        # _____Anomaly Clustering_____
         nmax=int(f_sampl * t_batch),
         scale=1.5,
         method="iqr",
         decomp=None,
-        # Clustering
         eps=1 / f_sampl,
-        # Coincidence
+
+        # _____Significance Evaluation_____
+        P_update=0.05,  # lambda update cutoff
+        smooth="cumulative",  # "cumulative" | "ema" | "kalman"
+        smooth_params=None,  # {"alpha": 0.1} or {"q": 1e-4, "r": 1e-2}
+
+        # _____Coincidence Analysis_____
         window_size=128,
         overlap=0.0,
         mean_func=har_mean,
-        # lambda update cutoff
-        P_update=0.05,
-        smooth="cumulative",   # "cumulative" | "ema" | "kalman"
-        smooth_params=None,    # {"alpha": 0.1} or {"q": 1e-4, "r": 1e-2}
+
+        # _____Autoregressive Veto_____
+        ## Background pool reference statistics
+        bkg_ref = None, # MUST BE REPLACED
+        ## Classification thresholds
+        fap_c = 0.053,  # For all triggers, GW vs NOS
+        alpha_d = 0.05, # For NOS, BKG vs GLC
     )
     
     # Replace values with user-provided overrides
@@ -673,21 +683,21 @@ def _format_config(config: Rist) -> str:
 
     # Input Data
     lines.append("\n[Input Data]")
-    lines.append(f"  Batch Duration    : {config['tbch']} s")
-    lines.append(f"  Sampling Frequency: {config['sampling_freq']} Hz")
+    lines.append(f"  Batch Duration     : {config['tbch']} s")
+    lines.append(f"  Sampling Frequency : {config['sampling_freq']} Hz")
 
     # Pipeline Architecture & Data Quality
     lines.append("\n[Pipeline Architecture]")
     arch_func = config["arch"]
     arch_name = arch_func.__name__ if callable(arch_func) else str(arch_func)
-    lines.append(f"  Processing routine: {arch_name}()")
-    lines.append(f"  Data Quality (DQ) : {config['DQ']}")
-    lines.append(f"  Number of Workers : {n_workers}")
+    lines.append(f"  Processing routine : {arch_name}()")
+    lines.append(f"  Data Quality (DQ)  : {config['DQ']}")
+    lines.append(f"  Number of Workers  : {n_workers}")
 
     # seqARIMA Parameters
     lines.append("\n[Sequential ARIMA]")
-    lines.append(f"  Differencing (d)  : {config['d']}")
-    lines.append(f"  AR order (p)      : {config['p']}")
+    lines.append(f"  Differencing (d)   : {config['d']}")
+    lines.append(f"  AR order (p)       : {config['p']}")
     q_range = config["q"]
     if hasattr(q_range, "__iter__") and not isinstance(q_range, str):
         try:
@@ -696,43 +706,49 @@ def _format_config(config: Rist) -> str:
             q_str = str(list(q_range))
     else:
         q_str = str(q_range)
-    lines.append(f"  MA orders (q)     : {q_str}")
-    lines.append(f"  Low freq (fl)     : {config['fl']} Hz")
-    lines.append(f"  High freq (fu)    : {config['fu']} Hz")
+    lines.append(f"  MA orders (q)      : {q_str}")
+    lines.append(f"  Low freq (fl)      : {config['fl']} Hz")
+    lines.append(f"  High freq (fu)     : {config['fu']} Hz")
 
     # Computed overlap from ARIMA
     n_missed = config["n_missed"]
-    lines.append(f"  Head loss (Mh)    : {n_missed[0]} samples")
-    lines.append(f"  Tail loss (Mt)    : {n_missed[1]} samples")
+    lines.append(f"  Head loss (Mh)     : {n_missed[0]} samples")
+    lines.append(f"  Tail loss (Mt)     : {n_missed[1]} samples")
 
-    # Anomaly Detection
-    lines.append("\n[Anomaly Detection]")
-    lines.append(f"  Max anomalies     : {config['nmax']}")
-    lines.append(f"  IQR scale         : {config['scale']}")
-    lines.append(f"  Method            : {config['method']}")
-    lines.append(f"  Decomposition     : {config['decomp']}")
-
-    # Clustering
-    lines.append("\n[Clustering (DBSCAN)]")
+    # Anomaly Clustering
+    lines.append("\n[Anomaly Clustering]")
+    lines.append(f"  Max anomalies      : {config['nmax']}")
+    lines.append(f"  IQR scale          : {config['scale']}")
+    lines.append(f"  Method             : {config['method']}")
+    lines.append(f"  Decomposition      : {config['decomp']}")
     eps_sec = config["eps"]
     sampling_freq = config["sampling_freq"]
     lines.append(
-        f"  Epsilon (eps)     : {eps_sec:.6f} sec ({eps_sec * sampling_freq:.2f} samples @ {sampling_freq} Hz)"
+        f"  Epsilon (eps)      : {eps_sec:.6f} sec ({eps_sec * sampling_freq:.2f} samples @ {sampling_freq} Hz)"
     )
+
+    # Significance Evaluation
+    lines.append("\n[Significance Evaluation]")
+    lines.append(f"  Lambda update P    : {config['P_update']}")
+    lines.append(f"  Updating strategy  : {config['smooth']}")
+    lines.append(f"  Updating parameter : {config['smooth_params']}")
 
     # Coincidence Analysis
     lines.append("\n[Coincidence Analysis]")
     lines.append(
-        f"  Window size       : {config['window_size']} samples (± {config['window_size'] / 2 / config['sampling_freq'] * 1000} ms)"
+        f"  Window size        : {config['window_size']} samples (± {config['window_size'] / 2 / config['sampling_freq'] * 1000} ms)"
     )
-    lines.append(f"  Overlap           : {config['overlap'] * 100:.1f}%")
+    lines.append(f"  Overlap            : {config['overlap'] * 100:.1f}%")
     mean_func = config["mean_func"]
     mean_func_name = mean_func.__name__ if callable(mean_func) else str(mean_func)
-    lines.append(f"  Mean function     : {mean_func_name}")
+    lines.append(f"  Mean function      : {mean_func_name}")
 
-    # Statistical Thresholds
-    lines.append("\n[Statistical Parameters]")
-    lines.append(f"  Lambda update P   : {config['P_update']}")
+    # Autoregressive Veto
+    lines.append("\n[Autoregressive Veto]")
+    is_bkg_prepared = config["bkg_ref"] is not None
+    lines.append(f"  BKG Pool Prepared? : {is_bkg_prepared}")
+    lines.append(f"  Thresh (GW vs NOS) : {config['fap_c']}")
+    lines.append(f"  Thresh (BKG vs GLC): {config['alpha_d']}")
 
     lines.append("=" * 60)
     return "\n".join(lines)

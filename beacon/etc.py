@@ -123,6 +123,7 @@ class Rist:
         names (list): List of names or None for unnamed elements.
         _name_to_index (dict): Mapping of names to indices for fast lookup.
     """
+    __slots__ = ["values", "names", "_name_to_index"]
 
     def __init__(self, *args, **kwargs):
         """
@@ -147,7 +148,7 @@ class Rist:
 
     def _rebuild_index(self):
         """
-        Rebuild internal name-to-index mapping after deletion or    reordering.
+        Rebuild internal name-to-index mapping after deletion or reordering.
         """
         self._name_to_index = {
             name: idx for idx, name in enumerate(self.names) if name is not None

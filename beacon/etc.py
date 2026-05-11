@@ -1,6 +1,6 @@
 import numpy as np
 from typing import Dict, Any
-
+from pympler import asizeof
 
 # Inspect function content
 def inspect_func(func):
@@ -16,6 +16,37 @@ def inspect_func(func):
     import inspect
 
     print(inspect.getsource(func))
+
+def format_size(size_bytes):
+    """Convert bytes to the most readable unit (MB, KB, B)"""
+    if size_bytes >= 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.4f} MB"
+    elif size_bytes >= 1024:
+        return f"{size_bytes / 1024:.2f} KB"
+    else:
+        return f"{size_bytes} B"
+
+
+def inspect_size(obj):
+    total_size = asizeof.asizeof(obj)
+    print(f"--- Object Size Inspection (Total: {format_size(total_size)}) ---")
+
+    # 1. For dictionaries: Show keys and their respective value sizes
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            size = asizeof.asizeof(value)
+            print(f"[Key] {str(key):<20} | {format_size(size)}")
+
+    # 2. For other iterables (excluding strings/bytes): Show index-based sizes
+    elif hasattr(obj, "__iter__") and not isinstance(obj, (str, bytes)):
+        for i, item in enumerate(obj):
+            size = asizeof.asizeof(item)
+            print(f"[Index] {i:<18} | {format_size(size)}")
+
+    # 3. For non-iterable single objects
+    else:
+        obj_type = type(obj).__name__
+        print(f"[Single Object] {obj_type:<11} | {format_size(asizeof.asizeof(obj))}")
 
 
 class _SummaryStats(dict):
@@ -221,6 +252,12 @@ class Rist:
         if idx is not None:
             return self.values[idx]
         raise AttributeError(f"'Rist' object has no attribute '{name}'")
+
+    def __contains__(self, key):
+        """Check if a named element exists."""
+        if isinstance(key, str):
+            return key in self._name_to_index
+        return key in self.values
 
     def __iter__(self):
         return iter(self.values)

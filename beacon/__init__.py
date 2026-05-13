@@ -11,6 +11,7 @@ from .etc import Rist
 from .etc import summary
 from . import plot
 from . import Pipe
+from . import featrues
 
 __all__ = [
     "TS", 
@@ -25,5 +26,6 @@ __all__ = [
     "Rist", 
     "summary", 
     "plot", 
-    "Pipe"
+    "Pipe",
+    "featrues"
 ]

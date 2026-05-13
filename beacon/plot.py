@@ -12,6 +12,7 @@ from .etc import Rist  # For R-style list container
 from cycler import cycler
 from cmap import Colormap
 import matplotlib.colors as mcolors
+from adjustText import adjust_text
 
 try:
     from pycbc.types import TimeSeries
@@ -883,3 +884,745 @@ def summary(x):
     # Printing
     for k in stats.keys():
         print(f"{k:>{label_width}} {formatted_values[k]:>{value_width}}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# AR veto diagnostics & classification plots
+# ──────────────────────────────────────────────────────────────────────────────
+from scipy.stats import chi2, beta as beta_dist, multivariate_normal
+
+
+def plot_coinc_clust(coinc_res, tzero=None, dt=None, figsize=(8, 5), ax=None):
+    """Plot coincidence clusters with colored spans and markers.
+
+    Args:
+        coinc_res: DataFrame with 'time_bin', 'S', 'coincl_id' columns.
+        tzero: reference GPS time (subtracted from time axis).
+        dt: ignored (computed from data).
+        figsize: figure size if standalone.
+        ax: optional axes to plot on.
+    """
+    if tzero is None:
+        tzero = 0
+
+    dt = coinc_res["time_bin"][1] - coinc_res["time_bin"][0]
+    half_dt = dt / 2
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+        is_standalone = True
+    else:
+        is_standalone = False
+
+    plot_coinc(coinc_res, tzero=tzero, a=1, ax=ax)
+
+    unique_clusters = (
+        coinc_res.filter(pl.col("coincl_id").is_not_null())["coincl_id"].unique().sort()
+    )
+    cmap_ = plt.get_cmap("tab10")
+    markers = ["o", "s", "^", "D", "*", "p", "v", "<", ">", "h"]
+
+    for i, c_id in enumerate(unique_clusters):
+        subset = coinc_res.filter(pl.col("coincl_id") == c_id)
+
+        t_min = (subset["time_bin"].min() - tzero) - half_dt
+        t_max = (subset["time_bin"].max() - tzero) + half_dt
+
+        cluster_color = cmap_(i % 10)
+        cluster_marker = markers[i % len(markers)]
+
+        ax.axvspan(t_min, t_max, color=cluster_color, alpha=0.2, zorder=1)
+        ax.scatter(
+            subset["time_bin"] - tzero,
+            subset["S"],
+            color=cluster_color,
+            marker=cluster_marker,
+            s=40,
+            label=f"Cluster {c_id}",
+            zorder=5,
+        )
+    if is_standalone:
+        plt.show()
+
+
+def plot_diag(res_net, coinc):
+    """3x1 (time series) + 2x1 (statistics) diagnostic dashboard.
+
+    Args:
+        res_net: BEACON pipeline result Rist (H1/L1).
+        coinc: coincidence DataFrame for the current batch.
+    """
+    from beacon.Pipe import cluster_coinc
+
+    plot_data = pl.DataFrame(
+        [
+            {
+                "index": i,
+                "Detector": det,
+                "lambda_c": it["stats"]["lambda_c"],
+                "lambda_a": it["stats"]["lambda_a"],
+            }
+            for det in res_net.names
+            for i, it in enumerate(res_net[det]["ustat"])
+        ]
+    )
+
+    t0 = min(
+        res_net["H1"]["proc"]["time"][0],
+        res_net["L1"]["proc"]["time"][0],
+    )
+
+    plt.rcdefaults()
+    fig = plt.figure(figsize=(16, 9))
+    gs = fig.add_gridspec(6, 3, hspace=0.3, wspace=0.3)
+
+    ax_l1 = fig.add_subplot(gs[0:2, 0:2])
+    ax_l2 = fig.add_subplot(gs[2:4, 0:2], sharex=ax_l1)
+    ax_l3 = fig.add_subplot(gs[4:6, 0:2], sharex=ax_l1)
+
+    ax_r1 = fig.add_subplot(gs[0:3, 2])
+    ax_r2 = fig.add_subplot(gs[3:6, 2], sharex=ax_r1)
+
+    plot_anomaly(
+        res_net["H1"]["proc"],
+        tzero=t0, ax=ax_l1, title=None, xlabel="",
+        ylabel=r"$h_{\rm H1}$",
+    )
+    plot_anomaly(
+        res_net["L1"]["proc"],
+        tzero=t0, ax=ax_l2, title=None, xlabel="",
+        ylabel=r"$h_{\rm L1}$",
+    )
+
+    coinc_clustered = cluster_coinc(coinc, eps=480 / 4096, min_samples=1)
+    plot_coinc_clust(coinc_clustered, tzero=t0, ax=ax_l3)
+    ax_l3.set_xlabel(f"Time (s) from {t0}")
+
+    detectors = plot_data["Detector"].unique().to_list()
+    det_colors = {"H1": "red", "L1": "blue"}
+
+    for det in detectors:
+        subset = plot_data.filter(pl.col("Detector") == det)
+        ax_r1.plot(
+            subset["index"] - len(subset["index"]) + 1,
+            subset["lambda_c"],
+            marker="o", color=det_colors.get(det), label=det, alpha=0.5,
+        )
+        ax_r2.plot(
+            subset["index"] - len(subset["index"]) + 1,
+            subset["lambda_a"],
+            marker="o", color=det_colors.get(det), label=det, alpha=0.5,
+        )
+
+    ax_r1.set_ylabel(r"$\lambda_c$")
+    ax_r2.set_ylabel(r"$\lambda_a$")
+    ax_r2.set_xlabel("Relative batch index")
+    ax_r2.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax_r2.legend(loc="best", frameon=True)
+
+    plt.setp(ax_l1.get_xticklabels(), visible=False)
+    plt.setp(ax_l2.get_xticklabels(), visible=False)
+    plt.setp(ax_r1.get_xticklabels(), visible=False)
+
+    for ax in [ax_l1, ax_l2, ax_l3, ax_r1, ax_r2]:
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+        ax.grid(True, linestyle=":", alpha=0.5)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_gmm2d(d2_H, d2_L, gmm, mask_normal, iso_dsq=None, ax=None,
+               show_abnormal=True, thresholds=None):
+    """2D GMM contours + data scatter on (d^2_H, d^2_L) plane.
+
+    Args:
+        d2_H: d^2 values for H1.
+        d2_L: d^2 values for L1.
+        gmm: fitted GaussianMixture (2 components, log10 space).
+        mask_normal: boolean mask for normal component.
+        iso_dsq: list of iso-d^2_joint values for contour lines.
+        ax: optional axes.
+        show_abnormal: whether to show abnormal component contours.
+        thresholds: dict with 'tau_H' and/or 'tau_L' threshold values.
+    """
+    n_norm, n_abn = int(mask_normal.sum()), int((~mask_normal).sum())
+    normal_idx = int(np.argmin(gmm.means_.sum(axis=1)))
+
+    pad = 0.2
+    log_range_h = np.linspace(
+        np.log10(d2_H.min()) - pad, np.log10(d2_H.max()) + pad, 200
+    )
+    log_range_l = np.linspace(
+        np.log10(d2_L.min()) - pad, np.log10(d2_L.max()) + pad, 200
+    )
+    grid_h, grid_l = np.meshgrid(log_range_h, log_range_l)
+    pos = np.stack([grid_h, grid_l], axis=-1)
+
+    xlo, xhi = 10 ** log_range_h[0], 10 ** log_range_h[-1]
+    ylo, yhi = 10 ** log_range_l[0], 10 ** log_range_l[-1]
+    lo, hi = min(xlo, ylo), max(xhi, yhi)
+
+    standalone = ax is None
+    if standalone:
+        fig, ax = plt.subplots(figsize=(5.5, 5.5))
+
+    comp_colors = ["red", "blue"]
+    comp_labels = ["Normal", "Abnormal"]
+    comp_order = [normal_idx, 1 - normal_idx]
+
+    for i, ci in enumerate(comp_order):
+        if i == 1 and not show_abnormal:
+            continue
+        rv = multivariate_normal(gmm.means_[ci], gmm.covariances_[ci])
+        pdf_vals = rv.pdf(pos) * gmm.weights_[ci]
+        levels = [pdf_vals.max() * np.exp(-0.5 * n**2) for n in [3, 2, 1]]
+        ax.contour(
+            10**grid_h, 10**grid_l, pdf_vals,
+            levels=levels, colors=comp_colors[i], alpha=0.7,
+        )
+        ax.scatter(
+            10 ** gmm.means_[ci, 0], 10 ** gmm.means_[ci, 1],
+            color=comp_colors[i], marker="x", s=100,
+            label=f"{comp_labels[i]} (w={gmm.weights_[ci]:.2f})",
+        )
+
+    if iso_dsq:
+        for S in iso_dsq:
+            d2h_line = np.linspace(0.01, S - 0.01, 500)
+            d2l_line = S - d2h_line
+            ax.plot(d2h_line, d2l_line, color="green", ls="--", lw=1.5, alpha=0.6)
+            ax.text(
+                S, lo, rf"$\Sigma={S}$", fontsize=7, color="green",
+                rotation=-80, ha="center", va="bottom", clip_on=True,
+            )
+
+    if thresholds:
+        if "tau_H" in thresholds:
+            ax.axvline(thresholds["tau_H"], color="red", ls=":", lw=1.5,
+                       alpha=0.7, label=rf"$\tau_H$={thresholds['tau_H']:.1f}")
+        if "tau_L" in thresholds:
+            ax.axhline(thresholds["tau_L"], color="blue", ls=":", lw=1.5,
+                       alpha=0.7, label=rf"$\tau_L$={thresholds['tau_L']:.1f}")
+
+    ax.scatter(
+        d2_H[mask_normal], d2_L[mask_normal],
+        alpha=0.25, s=5, color="red", label=f"Normal (n={n_norm})",
+    )
+    if show_abnormal:
+        ax.scatter(
+            d2_H[~mask_normal], d2_L[~mask_normal],
+            alpha=0.25, s=5, color="blue", label=f"Abnormal (n={n_abn})",
+        )
+    else:
+        ax.scatter(
+            d2_H[~mask_normal], d2_L[~mask_normal],
+            alpha=0.1, s=3, color="gray",
+        )
+
+    ax.set(
+        xscale="log", yscale="log",
+        xlabel=r"$d_{\rm H1}^2$", ylabel=r"$d_{\rm L1}^2$",
+        xlim=(lo, hi), ylim=(lo, hi), aspect="equal",
+    )
+    ax.grid(True, which="both", ls="-", alpha=0.2)
+    ax.legend(loc="upper left", fontsize=9)
+
+    if standalone:
+        plt.tight_layout()
+        plt.show()
+
+
+def plot_dist_chi2(d2, df_mle, ifo_label, alpha=0.05, ax=None):
+    """Histogram of d^2 with chi^2(df_mle) PDF overlay and threshold line.
+
+    Args:
+        d2: d^2 values (normal BKG subset).
+        df_mle: MLE degrees of freedom.
+        ifo_label: detector label string ('H1' or 'L1').
+        alpha: significance level for threshold.
+        ax: optional axes.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(5, 4))
+
+    bins = np.logspace(np.log10(max(d2.min(), 1)), np.log10(d2.max()), 60)
+    ax.hist(d2, bins=bins, density=True, alpha=0.4, color="tab:blue",
+            label=f"Normal BKG (n={len(d2)})")
+
+    x_grid = np.logspace(np.log10(bins[0]), np.log10(bins[-1]), 300)
+    ax.plot(x_grid, chi2.pdf(x_grid, df_mle), "k--", lw=1.5,
+            label=rf"$\chi^2$(df={df_mle:.1f})")
+
+    tau = chi2.ppf(1 - alpha, df_mle)
+    ax.axvline(tau, color="red", ls=":", lw=1.5,
+               label=rf"$\alpha$={alpha} ($\tau$={tau:.1f})")
+
+    ax.set(xscale="log", xlabel=rf"$d^2_{{\rm {ifo_label}}}$", ylabel="density")
+    ax.legend(fontsize=8)
+    ax.grid(True, which="both", alpha=0.3)
+
+
+def plot_dist_beta(C, alpha_beta, fap=0.053, ax=None):
+    """Histogram of C with Beta PDF overlay and threshold line.
+
+    Args:
+        C: signed cosine coherence values.
+        alpha_beta: Beta distribution shape parameter.
+        fap: false alarm probability for threshold.
+        ax: optional axes.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(5, 4))
+
+    ax.hist(C, bins=60, density=True, alpha=0.4, color="tab:blue",
+            label=f"BKG (n={len(C)})")
+
+    y = np.linspace(-1, 1, 300)
+    pdf_vals = beta_dist.pdf((y + 1) / 2, alpha_beta, alpha_beta) / 2
+    ax.plot(y, pdf_vals, "k--", lw=1.5,
+            label=rf"Beta({alpha_beta:.1f}, {alpha_beta:.1f})")
+
+    tau_C = 2 * beta_dist.ppf(1 - fap, alpha_beta, alpha_beta) - 1
+    ax.axvline(tau_C, color="red", ls=":", lw=1.5,
+               label=rf"FAP={fap:.3f} ($\tau_C$={tau_C:.3f})")
+
+    ax.set(xlabel="C", ylabel="density")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+
+def plot_bkg_summary(bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05):
+    """BKG pool summary: 2x2 diagnostic plot.
+
+    Layout:
+        [GMM 2D (d^2_H vs d^2_L) | C vs Beta        ]
+        [d^2_H vs chi^2(df_mle_H) | d^2_L vs chi^2(df_mle_L)]
+
+    Args:
+        bkg_fts: dict with 'dH', 'dL', 'uH', 'uL', 'gmm', 'mask_normal'.
+        bkg_ref: dict with 'df_mle_H', 'df_mle_L', 'alpha_beta'.
+        fap_c: FAP for C threshold.
+        alpha_d: significance level for d^2 threshold.
+    """
+    mask = bkg_fts["mask_normal"]
+    d2H = bkg_fts["dH"][mask] ** 2
+    d2L = bkg_fts["dL"][mask] ** 2
+    C = (bkg_fts["uH"] * bkg_fts["uL"]).sum(axis=1)
+
+    n_total = len(bkg_fts["dH"])
+    n_norm = int(mask.sum())
+    print(f"BKG Pool: {n_total} triggers")
+    print(f"  GMM: Normal={n_norm}, Abnormal={n_total - n_norm}")
+    print(f"  chi2 MLE: H1 df={bkg_ref['df_mle_H']:.2f}, "
+          f"L1 df={bkg_ref['df_mle_L']:.2f}")
+    print(f"  Beta: a=b={bkg_ref['alpha_beta']:.1f}")
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 10))
+    for ax in axes.flat:
+        ax.set_box_aspect(1)
+
+    plot_gmm2d(
+        bkg_fts["dH"] ** 2, bkg_fts["dL"] ** 2,
+        bkg_fts["gmm"], bkg_fts["mask_normal"], ax=axes[0, 0],
+    )
+    axes[0, 0].set_aspect("auto")
+
+    plot_dist_beta(C, bkg_ref["alpha_beta"], fap=fap_c, ax=axes[0, 1])
+    plot_dist_chi2(d2H, bkg_ref["df_mle_H"], "H1", alpha=alpha_d, ax=axes[1, 0])
+    plot_dist_chi2(d2L, bkg_ref["df_mle_L"], "L1", alpha=alpha_d, ax=axes[1, 1])
+
+    fig.suptitle(f"BKG Pool (n={n_total})", fontsize=13)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_3d(new_det, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05):
+    """Interactive 3D feature space visualization with BKG sigma-contours.
+
+    Requires plotly and scikit-image.
+
+    Args:
+        new_det: dict with 'd2H', 'd2L', 'C' arrays + 'labels' for new triggers.
+        bkg_fts: dict with 'dH', 'dL', 'uH', 'uL', 'mask_normal'.
+        bkg_ref: dict with 'df_mle_H', 'df_mle_L', 'alpha_beta'.
+        fap_c: FAP for C threshold.
+        alpha_d: significance level for d^2 threshold.
+    """
+    import plotly.graph_objects as go
+    from skimage.measure import marching_cubes
+
+    d2H_new = new_det["d2H"]
+    d2L_new = new_det["d2L"]
+    C_new = new_det["C"]
+    labels = new_det["labels"]
+
+    ab = bkg_ref["alpha_beta"]
+    tau_C = 2 * beta_dist.ppf(1 - fap_c, ab, ab) - 1
+    tau_H = chi2.ppf(1 - alpha_d, bkg_ref["df_mle_H"])
+    tau_L = chi2.ppf(1 - alpha_d, bkg_ref["df_mle_L"])
+
+    mask = bkg_fts["mask_normal"]
+    d2H_norm = bkg_fts["dH"][mask] ** 2
+    d2L_norm = bkg_fts["dL"][mask] ** 2
+    C_norm = (bkg_fts["uH"][mask] * bkg_fts["uL"][mask]).sum(axis=1)
+
+    log_d2H_range = [
+        np.log10(d2H_norm.min()) - 0.3,
+        np.log10(max(d2H_norm.max(), d2H_new.max())) + 0.3,
+    ]
+    log_d2L_range = [
+        np.log10(d2L_norm.min()) - 0.3,
+        np.log10(max(d2L_norm.max(), d2L_new.max())) + 0.3,
+    ]
+    C_range = [-1, 1]
+
+    N_GRID = 60
+    d2H_grid = np.logspace(*log_d2H_range, N_GRID)
+    d2L_grid = np.logspace(*log_d2L_range, N_GRID)
+    C_grid = np.linspace(*C_range, N_GRID)
+
+    D2H, D2L, CG = np.meshgrid(d2H_grid, d2L_grid, C_grid, indexing="ij")
+
+    log_pdf = (
+        chi2.logpdf(D2H, bkg_ref["df_mle_H"])
+        + np.log(D2H) + np.log(np.log(10))
+        + chi2.logpdf(D2L, bkg_ref["df_mle_L"])
+        + np.log(D2L) + np.log(np.log(10))
+        + np.log(np.clip(
+            beta_dist.pdf((CG + 1) / 2, ab, ab) / 2,
+            1e-300, None,
+        ))
+    )
+
+    log_pdf_max = np.nanmax(log_pdf)
+    neg2llr = -2 * (log_pdf - log_pdf_max)
+
+    sigma_levels = {
+        r"1$\sigma$": chi2.ppf(0.6827, 3),
+        r"2$\sigma$": chi2.ppf(0.9545, 3),
+        r"3$\sigma$": chi2.ppf(0.9973, 3),
+    }
+
+    log_d2H_grid = np.log10(d2H_grid)
+    log_d2L_grid = np.log10(d2L_grid)
+    spacing = [
+        (log_d2H_grid[-1] - log_d2H_grid[0]) / (N_GRID - 1),
+        (log_d2L_grid[-1] - log_d2L_grid[0]) / (N_GRID - 1),
+        (C_grid[-1] - C_grid[0]) / (N_GRID - 1),
+    ]
+    origin = [log_d2H_grid[0], log_d2L_grid[0], C_grid[0]]
+
+    fig = go.Figure()
+
+    sigma_colors = {
+        r"1$\sigma$": "rgba(0,100,255,0.35)",
+        r"2$\sigma$": "rgba(0,100,255,0.20)",
+        r"3$\sigma$": "rgba(0,100,255,0.10)",
+    }
+
+    for name in [r"3$\sigma$", r"2$\sigma$", r"1$\sigma$"]:
+        level = sigma_levels[name]
+        try:
+            verts, faces, _, _ = marching_cubes(neg2llr, level, spacing=spacing)
+            verts[:, 0] += origin[0]
+            verts[:, 1] += origin[1]
+            verts[:, 2] += origin[2]
+            fig.add_trace(go.Mesh3d(
+                x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
+                i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+                color=sigma_colors[name], opacity=0.3,
+                name=f"BKG {name}",
+            ))
+        except Exception as e:
+            print(f"{name} surface failed: {e}")
+
+    fig.add_trace(go.Scatter3d(
+        x=np.log10(d2H_norm), y=np.log10(d2L_norm), z=C_norm,
+        mode="markers",
+        marker=dict(size=2.5, color="steelblue", opacity=0.4),
+        name=f"Normal BKG (n={len(d2H_norm)})",
+    ))
+
+    marker_cfg = {
+        "GW": ("limegreen", "diamond"),
+        "GLC": ("darkorange", "cross"),
+        "BKG": ("gray", "circle"),
+    }
+    for lab in ["BKG", "GLC", "GW"]:
+        m = labels == lab
+        if not m.any():
+            continue
+        col, sym = marker_cfg[lab]
+        fig.add_trace(go.Scatter3d(
+            x=np.log10(d2H_new[m]), y=np.log10(d2L_new[m]), z=C_new[m],
+            mode="markers+text",
+            marker=dict(size=7, color=col, symbol=sym,
+                        line=dict(width=1, color="black")),
+            text=[f"#{i}" for i in np.where(m)[0]],
+            textposition="top center", textfont=dict(size=9),
+            name=f"new {lab} (n={m.sum()})",
+        ))
+
+    N_SURF = 30
+    gx = np.linspace(*log_d2H_range, N_SURF)
+    gy = np.linspace(*log_d2L_range, N_SURF)
+    GX, GY = np.meshgrid(gx, gy)
+    fig.add_trace(go.Surface(
+        x=GX, y=GY, z=np.full_like(GX, tau_C),
+        colorscale=[[0, "rgba(255,215,0,0.25)"],
+                     [1, "rgba(255,215,0,0.25)"]],
+        showscale=False, name=f"C = tau_C = {tau_C:.3f}",
+    ))
+    gy2 = np.linspace(*log_d2L_range, N_SURF)
+    gz2 = np.linspace(*C_range, N_SURF)
+    GY2, GZ2 = np.meshgrid(gy2, gz2)
+    fig.add_trace(go.Surface(
+        x=np.full_like(GY2, np.log10(tau_H)), y=GY2, z=GZ2,
+        colorscale=[[0, "rgba(255,0,0,0.15)"],
+                     [1, "rgba(255,0,0,0.15)"]],
+        showscale=False, name=f"d2_H1 = tau_H = {tau_H:.1f}",
+    ))
+    gx3 = np.linspace(*log_d2H_range, N_SURF)
+    gz3 = np.linspace(*C_range, N_SURF)
+    GX3, GZ3 = np.meshgrid(gx3, gz3)
+    fig.add_trace(go.Surface(
+        x=GX3, y=np.full_like(GX3, np.log10(tau_L)), z=GZ3,
+        colorscale=[[0, "rgba(0,0,255,0.15)"],
+                     [1, "rgba(0,0,255,0.15)"]],
+        showscale=False, name=f"d2_L1 = tau_L = {tau_L:.1f}",
+    ))
+
+    fig.update_layout(
+        scene=dict(
+            xaxis=dict(title="log10(d2_H1)"),
+            yaxis=dict(title="log10(d2_L1)"),
+            zaxis=dict(title="C"),
+            aspectmode="cube",
+        ),
+        title="3D Feature Space",
+        width=900, height=750,
+        legend=dict(x=0.01, y=0.99, font=dict(size=10)),
+        margin=dict(l=0, r=0, t=40, b=0),
+    )
+    fig.show()
+
+
+def plot_diag_classified(res_net, coinc_clust, classif_res, ar_seg_dur=32 * 15 / 4096):
+    """Diagnostic dashboard with classification overlay.
+
+    Extends plot_diag with trigger shading (3 panels) and classification
+    labels with p-value annotations.
+
+    Args:
+        res_net: BEACON pipeline result Rist (H1/L1).
+        coinc_clust: clustered coincidence DataFrame.
+        classif_res: classification result DataFrame.
+        ar_seg_dur: AR segment duration in seconds (for shading width).
+    """
+
+    plot_data = pl.DataFrame([
+        {"index": i, "Detector": det,
+         "lambda_c": it["stats"]["lambda_c"],
+         "lambda_a": it["stats"]["lambda_a"]}
+        for det in res_net.names
+        for i, it in enumerate(res_net[det]["ustat"])
+    ])
+    t0 = min(res_net["H1"]["proc"]["time"][0],
+             res_net["L1"]["proc"]["time"][0])
+
+    fig = plt.figure(figsize=(16, 9))
+    gs = fig.add_gridspec(6, 3, hspace=0.3, wspace=0.3)
+    ax_l1 = fig.add_subplot(gs[0:2, 0:2])
+    ax_l2 = fig.add_subplot(gs[2:4, 0:2], sharex=ax_l1)
+    ax_l3 = fig.add_subplot(gs[4:6, 0:2], sharex=ax_l1)
+    ax_r1 = fig.add_subplot(gs[0:3, 2])
+    ax_r2 = fig.add_subplot(gs[3:6, 2], sharex=ax_r1)
+    left_axes = [ax_l1, ax_l2, ax_l3]
+
+    plot_anomaly(res_net["H1"]["proc"], tzero=t0, ax=ax_l1,
+                 title=None, xlabel="", ylabel=r"$h_{\rm H1}$")
+    plot_anomaly(res_net["L1"]["proc"], tzero=t0, ax=ax_l2,
+                 title=None, xlabel="", ylabel=r"$h_{\rm L1}$")
+    plot_coinc_clust(coinc_clust, tzero=t0, ax=ax_l3)
+    ax_l3.set_xlabel(f"Time (s) from {t0}")
+
+    det_colors = {"H1": "red", "L1": "blue"}
+    for det in plot_data["Detector"].unique().to_list():
+        subset = plot_data.filter(pl.col("Detector") == det)
+        ax_r1.plot(subset["index"] - len(subset["index"]) + 1, subset["lambda_c"],
+                   marker="o", color=det_colors.get(det), label=det, alpha=0.5)
+        ax_r2.plot(subset["index"] - len(subset["index"]) + 1, subset["lambda_a"],
+                   marker="o", color=det_colors.get(det), label=det, alpha=0.5)
+    ax_r1.set_ylabel(r"$\lambda_c$")
+    ax_r2.set_ylabel(r"$\lambda_a$")
+    ax_r2.set_xlabel("Relative batch index")
+    ax_r2.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax_r2.legend(loc="best", frameon=True)
+
+    times = classif_res['times'].to_numpy()
+    labels = classif_res["label"].to_numpy()
+    glc_detail = classif_res["glc_detail"].to_numpy()
+    p_C = classif_res["p_C"].to_numpy()
+    p_dH = classif_res["p_dH"].to_numpy()
+    p_dL = classif_res["p_dL"].to_numpy()
+
+    label_colors = {"GW": "limegreen", "GLC": "darkorange", "BKG": "gray"}
+    for i in range(len(times)):
+        t_rel = times[i] - t0
+        t_min = t_rel - ar_seg_dur / 2
+        t_max = t_rel + ar_seg_dur / 2
+        col = label_colors[labels[i]]
+        for ax in left_axes:
+            ax.axvspan(t_min, t_max, color=col, alpha=0.25, zorder=0)
+
+    plt.setp(ax_l1.get_xticklabels(), visible=False)
+    plt.setp(ax_l2.get_xticklabels(), visible=False)
+    plt.setp(ax_r1.get_xticklabels(), visible=False)
+    for ax in left_axes + [ax_r1, ax_r2]:
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+        ax.grid(True, linestyle=":", alpha=0.5)
+    plt.tight_layout()
+
+    ymin3, ymax3 = ax_l3.get_ylim()
+    renderer = fig.canvas.get_renderer()
+    inv = ax_l3.transData.inverted()
+    tmp = ax_l3.text(0, 0, "GW\npC=1.0e-01", fontsize=7,
+                     bbox=dict(pad=2, boxstyle="round,pad=0.3"))
+    bb_data = inv.transform(tmp.get_window_extent(renderer).get_points())
+    box_h = bb_data[1, 1] - bb_data[0, 1]
+    tmp.remove()
+
+    margin = box_h * 0.3
+    y_text = ymax3 + margin + box_h / 2
+    new_ymax = y_text + box_h / 2 + margin
+    ax_l3.set_ylim(ymin3, new_ymax)
+
+    texts = []
+    target_x, target_y = [], []
+    for i in range(len(times)):
+        t_rel = times[i] - t0
+        col = label_colors[labels[i]]
+        if labels[i] == "GW":
+            txt = f"GW\npC={p_C[i]:.1e}"
+        else:
+            txt = (f"{labels[i]}{glc_detail[i]}\n"
+                   f"pdH={p_dH[i]:.1e}\npdL={p_dL[i]:.1e}")
+        txt_obj = ax_l3.text(t_rel, y_text, txt,
+                             fontsize=7, ha="center", va="center",
+                             bbox=dict(fc=col, alpha=0.4, pad=2,
+                                       boxstyle="round,pad=0.3"),
+                             zorder=10)
+        texts.append(txt_obj)
+        target_x.append(t_rel)
+        target_y.append(ymax3)
+
+    fig.canvas.draw()
+    adjust_text(texts, ax=ax_l3,
+                target_x=target_x, target_y=target_y,
+                force_text=(0.5, 1),
+                force_static=(2.0, 1.0),
+                force_pull=(1e-2, 1e-2),
+                force_explode=(0.5, 0.5),
+                max_move=(50, 25),
+                expand=(1.1, 1.0),
+                ensure_inside_axes=True,
+                min_arrow_len=5,
+                iter_lim=5,
+                arrowprops=dict(arrowstyle='->', color='gray', lw=0.5))
+    plt.show()
+
+
+def plot_det_bkg(classif_res, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05):
+    """2x2 classification result plot with BKG reference overlay.
+
+    Layout:
+        [2D: Normal contour + NOS triggers | C vs Beta + markers]
+        [d^2_H 1D + markers                | d^2_L 1D + markers]
+
+    Args:
+        classif_res: classification result DataFrame.
+        bkg_fts: dict with 'dH', 'dL', 'uH', 'uL', 'gmm', 'mask_normal'.
+        bkg_ref: dict with 'df_mle_H', 'df_mle_L', 'alpha_beta'.
+        fap_c: FAP for C threshold.
+        alpha_d: significance level for d^2 threshold.
+    """
+    d2H_new = classif_res['d2H'].to_numpy()
+    d2L_new = classif_res['d2L'].to_numpy()
+    C_new = classif_res['C'].to_numpy()
+    labels = classif_res['label'].to_numpy()
+    ab = bkg_ref["alpha_beta"]
+    tau_C = 2 * beta_dist.ppf(1 - fap_c, ab, ab) - 1
+    tau_H = chi2.ppf(1 - alpha_d, bkg_ref["df_mle_H"])
+    tau_L = chi2.ppf(1 - alpha_d, bkg_ref["df_mle_L"])
+
+    mask_bkg_norm = bkg_fts["mask_normal"]
+    d2H_bkg = bkg_fts["dH"][mask_bkg_norm] ** 2
+    d2L_bkg = bkg_fts["dL"][mask_bkg_norm] ** 2
+    C_bkg = (bkg_fts["uH"] * bkg_fts["uL"]).sum(axis=1)
+
+    label_colors = {"GW": "limegreen", "GLC": "darkorange", "BKG": "gray"}
+    n_triggers = len(C_new)
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 12))
+    for ax in axes.flat:
+        ax.set_box_aspect(1)
+
+    plot_gmm2d(
+        bkg_fts["dH"] ** 2, bkg_fts["dL"] ** 2,
+        bkg_fts["gmm"], bkg_fts["mask_normal"],
+        ax=axes[0, 0], show_abnormal=False,
+        thresholds={"tau_H": tau_H, "tau_L": tau_L},
+    )
+    axes[0, 0].set_aspect("auto")
+    for lab in ["BKG", "GLC"]:
+        m = labels == lab
+        if m.any():
+            axes[0, 0].scatter(
+                d2H_new[m], d2L_new[m], s=80, marker="*",
+                color=label_colors[lab], edgecolors="k", linewidths=0.5,
+                label=f"new {lab} (n={m.sum()})", zorder=5,
+            )
+    axes[0, 0].legend(loc="upper left", fontsize=8)
+
+    plot_dist_beta(C_bkg, bkg_ref["alpha_beta"], fap=fap_c, ax=axes[0, 1])
+    for lab in ["BKG", "GLC", "GW"]:
+        m = labels == lab
+        if m.any():
+            y_pdf = beta_dist.pdf((C_new[m] + 1) / 2, ab, ab) / 2
+            axes[0, 1].scatter(
+                C_new[m], y_pdf, s=80, marker="*",
+                color=label_colors[lab], edgecolors="k", linewidths=0.5,
+                label=f"new {lab}", zorder=5,
+            )
+    axes[0, 1].legend(fontsize=8)
+
+    plot_dist_chi2(d2H_bkg, bkg_ref["df_mle_H"], "H1", alpha=alpha_d, ax=axes[1, 0])
+    for lab in ["BKG", "GLC"]:
+        m = labels == lab
+        if m.any():
+            y_pdf = chi2.pdf(d2H_new[m], bkg_ref["df_mle_H"])
+            axes[1, 0].scatter(
+                d2H_new[m], y_pdf, s=80, marker="*",
+                color=label_colors[lab], edgecolors="k", linewidths=0.5,
+                label=f"new {lab}", zorder=5,
+            )
+    axes[1, 0].legend(fontsize=8)
+
+    plot_dist_chi2(d2L_bkg, bkg_ref["df_mle_L"], "L1", alpha=alpha_d, ax=axes[1, 1])
+    for lab in ["BKG", "GLC"]:
+        m = labels == lab
+        if m.any():
+            y_pdf = chi2.pdf(d2L_new[m], bkg_ref["df_mle_L"])
+            axes[1, 1].scatter(
+                d2L_new[m], y_pdf, s=80, marker="*",
+                color=label_colors[lab], edgecolors="k", linewidths=0.5,
+                label=f"new {lab}", zorder=5,
+            )
+    axes[1, 1].legend(fontsize=8)
+
+    fig.suptitle(f"Classification (n={n_triggers} triggers)", fontsize=13)
+    plt.tight_layout()
+    plt.show()

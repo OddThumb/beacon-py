@@ -27,8 +27,24 @@ import time
 import os
 
 # For checkpoint saving
+import json
+import pickle
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+# For AR veto classification
+from scipy.stats import chi2, beta as beta_dist
+from scipy.optimize import minimize_scalar
+from sklearn.mixture import GaussianMixture
+
+# For seqARIMA on|off denoising
+from .seqARIMA import pred_seqarima, extract_seqarima_params, fit_seqarima
+
+# For AR feature extraction
+from .features import (
+    extract_trigger_features, extract_raw_features,
+    whiten_with_bkg, decompose_vector, get_summary_feature,
+)
 
 # Turn off KPSS interpolation warning
 import warnings
@@ -441,59 +457,35 @@ def run_dbscan(
     return df.join(cluster_mapping, on="__id__", how="left").drop("__id__")
 
 
-def arch(ts_obj: ts, params: Rist) -> pl.DataFrame:
-    """
-    Full pipeline: Denoising → Anomaly detection → DBSCAN → Merge raw.
+def arch(ts_obj: ts, params: Rist, deno_params=None) -> pl.DataFrame:
+    """Full pipeline: Denoising -> Anomaly detection -> DBSCAN -> Merge raw.
 
     Args:
-        ts_obj (ts): Input time series.
-        params (Rist): Rist of parameters:
-            - nmax (int): Max number of anomalies.
-            - scale (float): IQR scale factor.
-            - d_max, p_max, q_max: ARIMA orders.
-            - fl, fu: Bandpass settings.
-            - method, decomp: anomaly() options.
-            - eps (float): DBSCAN epsilon.
+        ts_obj: input time series.
+        params: Rist of parameters (nmax, scale, d, p, q, fl, fu, method, eps).
+        deno_params: if None, fit seqarima (on|on). If provided, use
+            pred_seqarima with these parameters (on|off).
 
     Returns:
-        pl.DataFrame: Final processed DataFrame.
+        pl.DataFrame: processed DataFrame.
     """
-    # Step 1: Denoising
-    deno = seqarima(
-        ts_obj,
-        d=params.d,
-        p=params.p,
-        q=params.q,
-        fl=params.fl,
-        fu=params.fu,
-        verbose=False,
-    )
+    if deno_params is None:
+        deno = seqarima(
+            ts_obj, d=params.d, p=params.p, q=params.q,
+            fl=params.fl, fu=params.fu, verbose=False,
+        )
+    else:
+        deno = pred_seqarima(ts_obj, deno_params, verbose=False)
 
-    # Step 2: Anomaly detection
     anom = anomaly(deno, max_anom=params.nmax, scale=params.scale, method=params.method)
-
-    # Step 3: DBSCAN
     clustered = run_dbscan(anom, eps=params.eps)
-
-    # Step 4: Merge raw signal
     raw_df = as_pl(ts_obj).rename({"x": "raw"})
     merged = clustered.join(raw_df, on="time", how="left")
 
-    # Step 5: Column arrangement
-    base_cols = [
-        "time",
-        "anomaly",
-        "cluster",
-        "raw",
-        "observed",
-        "observed_l1",
-        "observed_l2",
-    ]
+    base_cols = ["time", "anomaly", "cluster", "raw",
+                 "observed", "observed_l1", "observed_l2"]
     extra_cols = [col for col in merged.columns if col not in base_cols]
-    col_order = base_cols + extra_cols
-    merged = merged.select(col_order)
-
-    return merged
+    return merged.select(base_cols + extra_cols)
 
 
 # Probabilistic Models ----
@@ -599,9 +591,8 @@ def config_pipe(replace: Optional[Rist] = None, show_config: bool = True) -> Ris
     conf = Rist(
         tbch=t_batch,
         sampling_freq=f_sampl,
-        arch=arch,
         DQ="BURST_CAT2",
-        n_workers=None,  # Defulat is None, this will be handled inside pipe_net()
+        n_workers=None,
 
         # _____Denoising(seqARIMA)_____
         d="auto",
@@ -626,14 +617,12 @@ def config_pipe(replace: Optional[Rist] = None, show_config: bool = True) -> Ris
         # _____Coincidence Analysis_____
         window_size=128,
         overlap=0.0,
-        mean_func=har_mean,
 
         # _____Autoregressive Veto_____
-        ## Background pool reference statistics
-        bkg_ref = None, # MUST BE REPLACED
-        ## Classification thresholds
-        fap_c = 0.053,  # For all triggers, GW vs NOS
-        alpha_d = 0.05, # For NOS, BKG vs GLC
+        feat_dim=32,
+        bkg_ref=None,
+        fap_c=0.053,
+        alpha_d=0.05,
     )
     
     # Replace values with user-provided overrides
@@ -688,9 +677,6 @@ def _format_config(config: Rist) -> str:
 
     # Pipeline Architecture & Data Quality
     lines.append("\n[Pipeline Architecture]")
-    arch_func = config["arch"]
-    arch_name = arch_func.__name__ if callable(arch_func) else str(arch_func)
-    lines.append(f"  Processing routine : {arch_name}()")
     lines.append(f"  Data Quality (DQ)  : {config['DQ']}")
     lines.append(f"  Number of Workers  : {n_workers}")
 
@@ -739,9 +725,6 @@ def _format_config(config: Rist) -> str:
         f"  Window size        : {config['window_size']} samples (± {config['window_size'] / 2 / config['sampling_freq'] * 1000} ms)"
     )
     lines.append(f"  Overlap            : {config['overlap'] * 100:.1f}%")
-    mean_func = config["mean_func"]
-    mean_func_name = mean_func.__name__ if callable(mean_func) else str(mean_func)
-    lines.append(f"  Mean function      : {mean_func_name}")
 
     # Autoregressive Veto
     lines.append("\n[Autoregressive Veto]")
@@ -772,22 +755,13 @@ def print_config(config: Rist, save_path: Optional[str] = None) -> None:
 
 
 def init_pipe(dets: List[str] = ["H1", "L1"]):
-    """
-    Initialize pipeline components for multiple detectors.
-
-    Args:
-        dets (List[str]): List of detector names.
+    """Initialize pipeline components for multiple detectors.
 
     Returns:
-        Tuple[dict, dict, list]:
-            - prev_batch: Rist with empty lists per detector.
-            - res_net: Rist with initialized Rist per detector.
-            - coinc_lis: Empty Rist for coincidences.
+        (prev_batch, res_net, coinc_lis, deno_parlist)
     """
-    # Empty previous batch per detector
     prev_batch = Rist(**{det: None for det in dets})
 
-    # Result template per detector
     res_det = Rist(
         proc=Rist(),
         stat=Rist(),
@@ -801,14 +775,11 @@ def init_pipe(dets: List[str] = ["H1", "L1"]):
             )
         ),
     )
-
-    # Copy template per detector
     res_net = Rist(**{det: res_det.copy() for det in dets})
-
-    # Coincidence list
     coinc_lis = Rist()
+    deno_parlist = {det: None for det in dets}
 
-    return prev_batch, res_net, coinc_lis
+    return prev_batch, res_net, coinc_lis, deno_parlist
 
 
 def tr_overlap(d: int, p: int, q: int, split: bool = False) -> Union[int, Rist]:
@@ -1385,30 +1356,35 @@ def update_logic(
 
 # Main pipeline (for single detector)
 def pipe(
-    curr_batch: ts, prev_batch: ts, res_list: Rist, arch_params: Rist, verb: bool = True
+    curr_batch: ts, prev_batch: ts, res_list: Rist,
+    config: Rist, deno_params=None, verb: bool = True,
 ) -> Rist:
-    if np.all(np.isnan(curr_batch.data)):
-        # If given current batch is NaN (by such as duty cycle issue)
-        append_result_NaN(res_list)
-        message_verb(
-            "WARNING: The current batch is NaN, might be due to the duty cycle", verb=verb
-        )
-    else:
-        arch = arch_params["arch"]
-        n_missed = arch_params["n_missed"]
-        DQ = arch_params["DQ"]
-        P_update = arch_params["P_update"]
+    """Single-detector pipeline: arch + significance evaluation.
 
-        # Processing
+    Args:
+        curr_batch: current batch time series.
+        prev_batch: previous batch time series.
+        res_list: accumulated results for this detector.
+        config: pipeline configuration.
+        deno_params: seqARIMA parameters for on|off mode (None = on|on).
+        verb: verbose output.
+    """
+    if np.all(np.isnan(curr_batch.data)):
+        append_result_NaN(res_list)
+        message_verb("WARNING: The current batch is NaN", verb=verb)
+    else:
+        n_missed = config["n_missed"]
+        DQ = config["DQ"]
+        P_update = config["P_update"]
+
         proc = arch(
             concat_ts(prev=prev_batch, curr=curr_batch, n_former=n_missed["Mh"]),
-            arch_params,
+            config, deno_params=deno_params,
         )
         proc = adjust_proc(proc, curr_batch=curr_batch, n_missed=n_missed)
         if DQ is not None:
             proc = add_DQ(proc, curr_batch)
 
-        # Compute statistics on current batch
         prev_updated_stat = res_list["ustat"][-1]
         prev_tcen = prev_updated_stat["last_tcen"]
         current_stat = stat_anom(
@@ -1416,38 +1392,28 @@ def pipe(
         )
         proc = add_stat(proc, stat_table=current_stat["table"])
 
-        # set_trace()
-
-        # Compute probabilities based on prev_updated_stat
         proc = add_Ppois(proc, prev_updated_stat.stats.lambda_a)
         proc = add_Pexp(proc, prev_updated_stat.stats.lambda_c)
         proc = add_P0(proc)
         if DQ is not None:
             proc = add_P0_DQ(proc, DQ)
 
-        # Update statistics with previous updated & current one
-        # if P_update != None, `update_logic()` will use prev_tcen and proc inside
         updated_stat = update_logic(
             updated=prev_updated_stat,
             current=current_stat,
             P_update=P_update,
             proc=proc,
             prev_tcen=prev_tcen,
-            smooth=arch_params["smooth"],
-            smooth_params=arch_params["smooth_params"],
+            smooth=config["smooth"],
+            smooth_params=config["smooth_params"],
         )
-
-        # Extract the last cluster's t_cen for the next batch
         updated_stat["last_tcen"] = get_last_tcen(proc, prev_tcen)
 
-        # Store results
         rist_append(res_list, "stat", current_stat)
         rist_append(
-            res_list,
-            "lamb",
-            Rist(
-                a=updated_stat["stats"]["lambda_a"], c=updated_stat["stats"]["lambda_c"]
-            ),
+            res_list, "lamb",
+            Rist(a=updated_stat["stats"]["lambda_a"],
+                 c=updated_stat["stats"]["lambda_c"]),
         )
         rist_append(res_list, "ustat", updated_stat)
         res_list["proc"] = proc
@@ -1548,13 +1514,15 @@ def coincide_P0(
 
     return grouped
 
-def _run_pipe_worker(det, batch_net, prev_batch, res_list_map, arch_params, verbose):
+def _run_pipe_worker(det, batch_net, prev_batch, res_list_map,
+                     config, deno_parlist, verbose):
     """Worker function for parallel pipe execution."""
     return pipe(
         curr_batch=batch_net[det],
         prev_batch=prev_batch[det],
         res_list=res_list_map[det],
-        arch_params=arch_params,
+        config=config,
+        deno_params=deno_parlist[det],
         verb=verbose,
     )
 
@@ -1562,60 +1530,41 @@ def pipe_net(
     batch_net: Rist,
     prev_batch: Rist,
     res_net: Rist,
-    coinc_lis: Rist,
-    arch_params: Rist,
+    coinc_list: Rist,
+    config: Rist,
+    deno_parlist: dict,
     use_thread: bool = True,
     verbose: bool = True,
-) -> tuple[Rist, Rist, Rist]:
-    """
-    Execute the anomaly detection pipeline in parallel across detectors.
-
-    Args:
-        batch_net (Rist): Current batch of time series per detector.
-        prev_batch (Rist): Previous batch per detector (used to detect edges).
-        res_net (Rist): Rist of lists accumulating per-detector pipeline results.
-        coinc_lis (Rist): Rist accumulating coincidence analysis results over batches.
-        arch_params (Rist): Rist containing pipeline parameters (window_size, overlap, DQ, etc.).
-        use_thread (bool): If True, run each detector in parallel using ThreadPoolExecutor.
-        verbose (bool): If True, print λ_c and λ_a after each detector update.
+) -> tuple:
+    """BEACON pipeline + AR veto per batch.
 
     Returns:
-        Tuple[Rist, Rist, Rist]: Updated (res_net, prev_batch, coinc_lis).
+        (res_net, prev_batch, coinc_list, classif_res,
+         deno_parlist_upd, raw_feature, bkg_flag)
     """
     dets = batch_net.names
     res_list_map = {det: res_net[det].copy() for det in dets}
+    max_workers = (config.n_workers or len(dets)) if use_thread else 1
 
-    if use_thread:
-        max_workers = arch_params.n_workers
-        if max_workers is None:
-            max_workers = len(dets)
-
-        with parallel_backend('loky', inner_max_num_threads=1):
-            res_list = Parallel(n_jobs=max_workers)(
-                delayed(_run_pipe_worker)(
-                    det, batch_net, prev_batch, res_list_map, arch_params, verbose
-                )
-                for det in dets
+    with parallel_backend("loky", inner_max_num_threads=1):
+        res_list = Parallel(n_jobs=max_workers)(
+            delayed(_run_pipe_worker)(
+                det, batch_net, prev_batch, res_list_map,
+                config, deno_parlist, verbose,
             )
-    else:
-        res_list = [
-            _run_pipe_worker(det, batch_net, prev_batch, res_list_map, arch_params, verbose)
             for det in dets
-        ]
+        )
     res_net_updated = Rist(**dict(zip(dets, res_list)))
-
     for det in dets:
         prev_batch[det] = batch_net[det]
 
     if verbose:
         for det in dets:
             try:
-                last_lambda = res_net_updated[det]["lamb"][-1]
-                lambda_c = last_lambda["c"]
-                lambda_a = last_lambda["a"]
-                print(f"  {det}: λ_c={lambda_c:.3f}, λ_a={lambda_a:.3f}")
+                lam = res_net_updated[det]["lamb"][-1]
+                print(f"  {det}: lambda_c={lam['c']:.3f}, lambda_a={lam['a']:.3f}")
             except Exception:
-                print(f"  {det}: λ not available")
+                print(f"  {det}: lambda not available")
 
     if any(is_all_nan(res_net_updated[det]["proc"]) for det in dets):
         coinc_res = None
@@ -1624,43 +1573,60 @@ def pipe_net(
             coinc_res = coincide_P0(
                 shift_proc=res_net_updated["H1"]["proc"],
                 ref_proc=res_net_updated["L1"]["proc"],
-                window_size=arch_params["window_size"],
-                overlap=arch_params["overlap"] if "overlap" in arch_params else 0.0,
-                mean_func=(
-                    arch_params["mean_func"] if "mean_func" in arch_params else har_mean
-                ),
-                p_col=(
-                    f"P0_{arch_params['DQ']}" if arch_params["DQ"] is not None else "P0"
-                ),
+                window_size=config["window_size"],
+                overlap=config["overlap"],
+                mean_func=har_mean,
+                p_col=f"P0_{config['DQ']}" if config["DQ"] is not None else "P0",
             )
         except Exception as e:
             print(f"  [coincide_P0 error] {e}")
             coinc_res = None
 
-    coinc_lis.append(coinc_res)
+    if coinc_res is not None:
+        coinc_clust, triggers = cluster_coinc_triggers(coinc_res)
+    else:
+        coinc_clust = None
+        triggers = pl.DataFrame()
 
-    return res_net_updated, prev_batch, coinc_lis
+    coinc_list.append(coinc_clust)
+
+    bkg_ref = config["bkg_ref"]
+    fap_c = config["fap_c"]
+    alpha_d = config["alpha_d"]
+
+    raw_feature, classif_res, bkg_flag = ARveto(
+        res_net_updated, triggers, bkg_ref, fap_c, alpha_d
+    )
+
+    with parallel_backend("loky", inner_max_num_threads=1):
+        results = Parallel(n_jobs=max_workers)(
+            delayed(update_deno_params)(
+                batch_net[det], config=config,
+                deno_params=deno_parlist[det], isbkg=bkg_flag[det],
+            )
+            for det in dets
+        )
+    deno_parlist_upd = dict(zip(dets, results))
+
+    return (res_net_updated, prev_batch, coinc_list,
+            classif_res, deno_parlist_upd, raw_feature, bkg_flag)
 
 
 # Streaming batch data into pipe_net
 def _get_summary_schema(dets: List[str]) -> pa.Schema:
-    """
-    Define PyArrow schema for summary.parquet.
-
-    Columns: batch_id, detector, t_batch, N_cl, N_anom,
-             lambda_a, lambda_c, lambda_a_upd, lambda_c_upd, eta
-    """
+    """PyArrow schema for summary.parquet (includes bkg_flag)."""
     return pa.schema([
-        ('batch_id', pa.int32()),
-        ('detector', pa.string()),
-        ('t_batch', pa.float64()),
-        ('N_cl', pa.int32()),
-        ('N_anom', pa.int32()),
-        ('lambda_a', pa.float64()),
-        ('lambda_c', pa.float64()),
-        ('lambda_a_upd', pa.float64()),
-        ('lambda_c_upd', pa.float64()),
-        ('eta', pa.float64()),
+        ("batch_id", pa.int32()),
+        ("detector", pa.string()),
+        ("t_batch", pa.float64()),
+        ("N_cl", pa.int32()),
+        ("N_anom", pa.int32()),
+        ("lambda_a", pa.float64()),
+        ("lambda_c", pa.float64()),
+        ("lambda_a_upd", pa.float64()),
+        ("lambda_c_upd", pa.float64()),
+        ("bkg_flag", pa.bool_()),
+        ("eta", pa.float64()),
     ])
 
 
@@ -1668,27 +1634,24 @@ def _build_summary_rows(
     batch_id: int,
     dets: List[str],
     res_net: Rist,
+    bkg_flag: dict,
     eta: float,
 ) -> List[dict]:
-    """
-    Build summary rows for current batch (one row per detector).
-    """
+    """Build summary rows for current batch (one row per detector, includes bkg_flag)."""
     rows = []
     for det in dets:
-        # Current batch stat
         current_stat = res_net[det]["stat"][-1] if len(res_net[det]["stat"]) > 0 else None
-        # Updated (cumulative) lambda
         current_lamb = res_net[det]["lamb"][-1] if len(res_net[det]["lamb"]) > 0 else None
 
         if current_stat is not None and not is_all_nan(current_stat):
             stats = current_stat["stats"]
-            t_batch = stats["t_batch"]
+            t_batch_val = stats["t_batch"]
             N_cl = stats["N_cl"]
             N_anom = stats["N_anom"]
             lambda_a = stats["lambda_a"]
             lambda_c = stats["lambda_c"]
         else:
-            t_batch = np.nan
+            t_batch_val = np.nan
             N_cl = 0
             N_anom = 0
             lambda_a = np.nan
@@ -1702,160 +1665,214 @@ def _build_summary_rows(
             lambda_c_upd = np.nan
 
         rows.append({
-            'batch_id': batch_id,
-            'detector': det,
-            't_batch': float(t_batch) if not np.isnan(t_batch) else None,
-            'N_cl': int(N_cl) if N_cl is not None else None,
-            'N_anom': int(N_anom) if N_anom is not None else None,
-            'lambda_a': float(lambda_a) if not np.isnan(lambda_a) else None,
-            'lambda_c': float(lambda_c) if not np.isnan(lambda_c) else None,
-            'lambda_a_upd': float(lambda_a_upd) if not np.isnan(lambda_a_upd) else None,
-            'lambda_c_upd': float(lambda_c_upd) if not np.isnan(lambda_c_upd) else None,
-            'eta': float(eta),
+            "batch_id": batch_id,
+            "detector": det,
+            "t_batch": float(t_batch_val) if not np.isnan(t_batch_val) else None,
+            "N_cl": int(N_cl) if N_cl is not None else None,
+            "N_anom": int(N_anom) if N_anom is not None else None,
+            "lambda_a": float(lambda_a) if not np.isnan(lambda_a) else None,
+            "lambda_c": float(lambda_c) if not np.isnan(lambda_c) else None,
+            "lambda_a_upd": float(lambda_a_upd) if not np.isnan(lambda_a_upd) else None,
+            "lambda_c_upd": float(lambda_c_upd) if not np.isnan(lambda_c_upd) else None,
+            "bkg_flag": bkg_flag[det],
+            "eta": float(eta),
         })
     return rows
 
 
 def stream(
     batch_set: Rist,
-    arch_params: Rist,
+    config: Rist,
+    checkpoint_dir: str,
     use_model: Rist = None,
-    checkpoint_dir: Optional[str] = None,
-) -> Rist:
-    """
-    Run full anomaly detection stream over multiple batches.
+    verbose: bool = True,
+) -> dict:
+    """Non-generator batch loop with mandatory checkpoint.
+
+    Phase 1 (config['bkg_ref'] is None):
+        All batches assumed BKG (bkg_flag=True). Extracts XH/XL features
+        from coinc_clust triggers and accumulates them. After the loop,
+        calls fit_bkg_reference -> saves bkg_ref.npz + bkg_fts.pkl.
+        Inserts config dict into bkg_ref (for Phase 2 consistency check).
+    Phase 2 (config['bkg_ref'] provided):
+        Verifies config consistency (bkg_ref['config'] vs current config).
+        Performs ARveto classification, saves classif_res per batch.
+
+    Common:
+        Saves config.json, proc (with bin_id), coinc_clust, summary
+        per batch. Saves deno_params only for BKG-flagged detectors.
+        Clears memory after each batch (proc/stat/lamb/coinc).
 
     Args:
-        batch_set (Rist): Sequence of batches, each a Rist of detectors.
-        arch_params (Rist): Pipeline configuration parameters.
-        use_model (Rist, optional): Pretrained ustat per detector.
-        checkpoint_dir (str, optional): Directory to save checkpoint files.
-            If None, all results are kept in memory (original behavior).
-            If specified, results are saved incrementally and memory is cleared.
+        batch_set: sequence of batches, each a Rist of detectors.
+        config: pipeline configuration parameters.
+        Must include 'feat_dim' key (AR feature dimension).
+        checkpoint_dir: directory for checkpoint output (mandatory).
+        use_model: pretrained ustat per detector.
+        verbose: print progress information.
 
     Returns:
-        Rist:
-            If checkpoint_dir is None:
-                {'res_net', 'coinc_lis', 'model', 'arch_params', 'summary', 'eta'}
-            If checkpoint_dir is specified:
-                {'model', 'arch_params', 'summary', 'checkpoint_dir'}
-                (res_net and coinc_lis are saved to disk and cleared from memory)
+        dict with paths and (Phase 1 only) bkg_ref/bkg_fts objects.
     """
     dets = batch_set[0].names
-    checkpoint_mode = checkpoint_dir is not None
+    feat_dim = config["feat_dim"]
+    bkg_ref = config["bkg_ref"]
+    is_phase1 = bkg_ref is None
+    window_size = config["window_size"]
+    overlap = config["overlap"]
 
-    prev_batch, res_net, coinc_lis = init_pipe(dets)
+    if not is_phase1:
+        _check_config_consistency(bkg_ref, config)
 
-    # If pretrained model is provided
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    proc_dir = os.path.join(checkpoint_dir, "proc")
+    coinc_dir = os.path.join(checkpoint_dir, "coinc")
+    classif_dir = os.path.join(checkpoint_dir, "classif")
+    deno_dir = os.path.join(checkpoint_dir, "deno_params")
+    os.makedirs(proc_dir, exist_ok=True)
+    os.makedirs(coinc_dir, exist_ok=True)
+    if not is_phase1:
+        os.makedirs(classif_dir, exist_ok=True)
+    os.makedirs(deno_dir, exist_ok=True)
+
+    config_path = os.path.join(checkpoint_dir, "config.json")
+    config_dict = save_config(config, config_path)
+
+    summary_path = os.path.join(checkpoint_dir, "summary.parquet")
+    summary_schema = _get_summary_schema(dets)
+    summary_writer = pq.ParquetWriter(summary_path, summary_schema)
+
+    prev_batch, res_net, coinc_lis, deno_parlist = init_pipe(dets)
     if use_model is not None:
         for det in dets:
             res_net[det]["ustat"] = Rist(use_model[det])
 
-    # Setup checkpoint directories and writers
-    if checkpoint_mode:
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        proc_dir = os.path.join(checkpoint_dir, "proc")
-        coinc_dir = os.path.join(checkpoint_dir, "coinc")
-        os.makedirs(proc_dir, exist_ok=True)
-        os.makedirs(coinc_dir, exist_ok=True)
-
-        # Initialize ParquetWriter for summary
-        summary_path = os.path.join(checkpoint_dir, "summary.parquet")
-        summary_schema = _get_summary_schema(dets)
-        summary_writer = pq.ParquetWriter(summary_path, summary_schema)
+    if is_phase1:
+        xh_accum, xl_accum = [], []
 
     eta_lis = []
     for i in range(len(batch_set)):
-        print(f"{i + 1}-th batch:")
+        batch_id = i + 1
+        if verbose:
+            print(f"{batch_id}-th batch:")
         start = time.time()
 
-        res_net, prev_batch, coinc_lis = pipe_net(
+        (
+            res_net, prev_batch, coinc_lis,
+            classif_res, deno_parlist, raw_feature, bkg_flag,
+        ) = pipe_net(
             batch_net=batch_set[i],
             prev_batch=prev_batch,
             res_net=res_net,
-            coinc_lis=coinc_lis,
-            arch_params=arch_params
+            coinc_list=coinc_lis,
+            config=config,
+            deno_parlist=deno_parlist,
+            verbose=verbose,
         )
 
         eta = time.time() - start
         eta_lis.append(eta)
 
-        # Checkpoint mode: save and clear memory
-        if checkpoint_mode:
-            batch_id = i + 1
+        if is_phase1:
+            coinc_last = coinc_lis[-1] if len(coinc_lis) > 0 else None
+            if coinc_last is not None:
+                triggers_p1 = filter_centroid_time(coinc_last)
+                if len(triggers_p1) > 0:
+                    XH_i, XL_i, _, _ = extract_raw_features(
+                        res_net, triggers_p1)
+                    xh_accum.append(XH_i)
+                    xl_accum.append(XL_i)
 
-            # 1) Save proc for each detector
-            for det in dets:
-                proc = res_net[det]["proc"]
-                if proc is not None and not is_all_nan(proc):
-                    proc_path = os.path.join(proc_dir, f"batch_{batch_id:04d}_{det}.parquet")
-                    proc.write_parquet(proc_path)
-
-            # 2) Save coinc
-            coinc_res = coinc_lis[-1] if len(coinc_lis) > 0 else None
-            if coinc_res is not None:
-                coinc_path = os.path.join(coinc_dir, f"batch_{batch_id:04d}.parquet")
-                coinc_res.write_parquet(coinc_path)
-
-            # 3) Append summary rows
-            summary_rows = _build_summary_rows(batch_id, dets, res_net, eta)
-            summary_table = pa.Table.from_pylist(summary_rows, schema=summary_schema)
-            summary_writer.write_table(summary_table)
-
-            # 4) Clear memory: keep only last ustat for next batch
-            for det in dets:
-                res_net[det]["proc"] = None
-                res_net[det]["stat"] = Rist()
-                res_net[det]["lamb"] = Rist()
-                # Keep only the last ustat (needed for next batch)
-                last_ustat = res_net[det]["ustat"][-1]
-                res_net[det]["ustat"] = Rist(last_ustat)
-
-            coinc_lis = Rist()
-
-    # Finalize
-    if checkpoint_mode:
-        summary_writer.close()
-
-        # Save final model
-        model = Rist(**{det: res_net[det]["ustat"][-1] for det in dets})
-        model_path = os.path.join(checkpoint_dir, "model.pkl")
-        model.save(model_path)
-
-        # Load summary back for return value
-        summary_df = pl.read_parquet(summary_path)
-
-        return Rist(
-            model=model,
-            arch_params=arch_params,
-            summary=summary_df,
-            eta=eta_lis,
-            checkpoint_dir=checkpoint_dir,
-        )
-    else:
-        # Original behavior: keep everything in memory
-        # Summary (last ustat per detector)
-        summary_rows = []
         for det in dets:
+            proc = res_net[det]["proc"]
+            if proc is not None and not is_all_nan(proc):
+                proc_with_bid = assign_bin_ids_to_proc(
+                    proc, window_size, overlap)
+                proc_with_bid.write_parquet(
+                    os.path.join(proc_dir,
+                                 f"batch_{batch_id:04d}_{det}.parquet"))
+
+        coinc_last = coinc_lis[-1] if len(coinc_lis) > 0 else None
+        if coinc_last is not None:
+            coinc_last.write_parquet(
+                os.path.join(coinc_dir, f"batch_{batch_id:04d}.parquet"))
+
+        if not is_phase1 and classif_res is not None:
+            classif_res.write_parquet(
+                os.path.join(classif_dir, f"batch_{batch_id:04d}.parquet"))
+
+        for det in dets:
+            if bkg_flag[det] and deno_parlist[det] is not None:
+                with open(os.path.join(
+                        deno_dir,
+                        f"batch_{batch_id:04d}_{det}.pkl"), "wb") as f:
+                    pickle.dump(deno_parlist[det], f)
+
+        summary_rows = _build_summary_rows(
+            batch_id, dets, res_net, bkg_flag, eta)
+        summary_writer.write_table(
+            pa.Table.from_pylist(summary_rows, schema=summary_schema))
+
+        for det in dets:
+            res_net[det]["proc"] = None
+            res_net[det]["stat"] = Rist()
+            res_net[det]["lamb"] = Rist()
             last_ustat = res_net[det]["ustat"][-1]
-            df_row = pl.DataFrame(last_ustat.to_dict(flat=True)).with_columns(
-                pl.lit(det).alias("detector"),
-                pl.lit(batch_set[0][det].start).alias("start_time"),
-            )
-            summary_rows.append(df_row)
-        summary_df = pl.concat(summary_rows, how="vertical")
+            res_net[det]["ustat"] = Rist(last_ustat)
+        coinc_lis = Rist()
 
-        # Final model: last ustat per detector
-        model = Rist(**{det: res_net[det]["ustat"][-1] for det in dets})
+    summary_writer.close()
 
-        return Rist(
-            res_net=res_net,
-            coinc_lis=coinc_lis,
-            model=model,
-            arch_params=arch_params,
-            summary=summary_df,
-            eta=eta_lis,
-        )
+    model_path = os.path.join(checkpoint_dir, "model.pkl")
+    model_state = {det: res_net[det]["ustat"][-1] for det in dets}
+    with open(model_path, "wb") as f:
+        pickle.dump(model_state, f)
+
+    result = {
+        "summary_path": summary_path,
+        "model_path": model_path,
+        "config_path": config_path,
+    }
+
+    if is_phase1:
+        XH_pool = (np.vstack(xh_accum) if xh_accum
+                   else np.empty((0, feat_dim)))
+        XL_pool = (np.vstack(xl_accum) if xl_accum
+                   else np.empty((0, feat_dim)))
+        print(f"\n[Phase 1 done] Feature pool: "
+              f"XH={XH_pool.shape}, XL={XL_pool.shape}")
+
+        bkg_ref_out, bkg_fts_out = fit_bkg_reference(
+            XH_pool, XL_pool, n_feat=feat_dim)
+
+        bkg_ref_out["config"] = config_dict
+
+        bkg_ref_path = os.path.join(checkpoint_dir, "bkg_ref.npz")
+        np.savez(bkg_ref_path,
+                 **{k: v for k, v in bkg_ref_out.items()
+                    if isinstance(v, np.ndarray)},
+                 **{k: np.array([v]) for k, v in bkg_ref_out.items()
+                    if isinstance(v, (int, float,
+                                      np.integer, np.floating))})
+
+        bkg_fts_path = os.path.join(checkpoint_dir, "bkg_fts.pkl")
+        with open(bkg_fts_path, "wb") as f:
+            pickle.dump(bkg_fts_out, f)
+
+        bkg_ref_pkl_path = os.path.join(checkpoint_dir, "bkg_ref.pkl")
+        with open(bkg_ref_pkl_path, "wb") as f:
+            pickle.dump(bkg_ref_out, f)
+
+        result.update({
+            "bkg_ref": bkg_ref_out,
+            "bkg_fts": bkg_fts_out,
+            "bkg_ref_path": bkg_ref_pkl_path,
+            "bkg_fts_path": bkg_fts_path,
+        })
+
+    print(f"\n{len(batch_set)} batches done. "
+          f"Mean eta={np.mean(eta_lis):.3f}s")
+    return result
 
 
 def reproduce(
@@ -2053,3 +2070,467 @@ def Significance(P: ArrayLike, a: float = 2.3) -> Union[float, NDArray[np.float6
     s = -a * np.log10(p)
     # Preserve scalar return for scalar input
     return s.item() if s.ndim == 0 else s
+
+
+# ---------------------------------------------------------------------------
+# AR veto helper functions
+# ---------------------------------------------------------------------------
+
+def proc2ts(proc, value_col="observed", time_col="time",
+            sampling_freq=4096):
+    """Convert BEACON proc DataFrame to a beacon.ts time series object.
+
+    Args:
+        proc: Polars DataFrame with time and value columns.
+        value_col: column name for observed values.
+        time_col: column name for GPS time.
+        sampling_freq: sampling frequency in Hz.
+    """
+    return ts(proc[value_col], start=proc[time_col][0],
+              sampling_freq=sampling_freq)
+
+
+def filter_centroid_time(coinc_clust):
+    """Select the peak-S row per coincidence cluster (centroid).
+
+    Args:
+        coinc_clust: output of cluster_coinc (must have coincl_id column).
+
+    Returns:
+        pl.DataFrame with one row per cluster, sorted by time_bin.
+    """
+    return (
+        coinc_clust
+        .filter(pl.col("coincl_id").is_not_null())
+        .filter(pl.col("S") == pl.col("S").max().over("coincl_id"))
+        .unique(subset=["coincl_id"])
+        .sort("time_bin")
+    )
+
+
+def cluster_coinc(coinc_res, eps, min_samples):
+    """Add Significance column and DBSCAN-cluster the coincidence result.
+
+    Args:
+        coinc_res: coincidence DataFrame from coincide_P0.
+        eps: DBSCAN epsilon (seconds).
+        min_samples: DBSCAN min_samples.
+
+    Returns:
+        pl.DataFrame with S and coincl_id columns added.
+    """
+    coinc_res = coinc_res.with_columns(
+        [
+            pl.col("P0_net")
+            .map_elements(lambda x: Significance(x, a=1),
+                          return_dtype=pl.Float64)
+            .alias("S")
+            .fill_nan(0)
+        ]
+    )
+    db_res = run_dbscan(
+        coinc_res, eps, min_samples,
+        time_col="time_bin", anomaly_col="S",
+    )
+    return db_res.rename({"cluster": "coincl_id"})
+
+
+def cluster_coinc_triggers(coinc_res, eps=32 * 15 / 4096, min_samples=1):
+    """Cluster coincidence result and extract centroid triggers.
+
+    Args:
+        coinc_res: coincidence DataFrame from coincide_P0.
+        eps: DBSCAN epsilon (seconds).
+        min_samples: DBSCAN min_samples.
+
+    Returns:
+        (coinc_clust, triggers) — coinc_clust is the full clustered
+        DataFrame; triggers is the centroid rows (or empty DataFrame).
+    """
+    coinc_clust = cluster_coinc(coinc_res, eps, min_samples)
+    triggers = filter_centroid_time(coinc_clust)
+    return coinc_clust, triggers
+
+
+def collect_bkg_pool(batch_iter, feat_dim=32):
+    """Collect BKG trigger AR features across multiple batches.
+
+    Args:
+        batch_iter: iterable of (res_net, coinc_clust) tuples.
+            coinc_clust should already have S/coincl_id columns.
+        feat_dim: maximum AR order (feature dimension).
+
+    Returns:
+        (XH_pool, XL_pool) — numpy arrays, shape (n_total, feat_dim).
+    """
+    xh_list, xl_list = [], []
+    for i, (res_net, coinc_clust) in enumerate(batch_iter):
+        if coinc_clust is None:
+            print(f"  batch {i+1}: coinc_clust=None, skip")
+            continue
+        triggers = filter_centroid_time(coinc_clust)
+        if len(triggers) == 0:
+            print(f"  batch {i+1}: +0 triggers")
+            continue
+        XH, XL, _, _ = extract_raw_features(res_net, triggers)
+        xh_list.append(XH)
+        xl_list.append(XL)
+        n_total = sum(len(x) for x in xh_list)
+        print(f"  batch {i+1}: +{len(XH)} -> total {n_total}")
+
+    XH_pool = (np.vstack(xh_list) if xh_list
+               else np.empty((0, feat_dim)))
+    XL_pool = (np.vstack(xl_list) if xl_list
+               else np.empty((0, feat_dim)))
+    return XH_pool, XL_pool
+
+
+def fit_bkg_reference(XH_pool, XL_pool, n_feat=32):
+    """Fit BKG reference: whitening + 2D GMM Normal separation + per-IFO chi2 MLE.
+
+    Args:
+        XH_pool: H1 AR feature pool, shape (n, n_feat).
+        XL_pool: L1 AR feature pool, shape (n, n_feat).
+        n_feat: feature dimension (for Beta alpha/beta parameter).
+
+    Returns:
+        (bkg_ref, bkg_fts) — bkg_ref contains whitening params and
+        distribution parameters; bkg_fts contains diagnostic data.
+    """
+    ZH, (mu_H, S_H) = whiten_with_bkg(XH_pool, XH_pool)
+    ZL, (mu_L, S_L) = whiten_with_bkg(XL_pool, XL_pool)
+
+    dH, uH = decompose_vector(ZH)
+    dL, uL = decompose_vector(ZL)
+
+    gmm_input = np.column_stack([np.log10(dH**2), np.log10(dL**2)])
+    gmm = GaussianMixture(n_components=2, random_state=42).fit(gmm_input)
+    normal_idx = int(np.argmin(gmm.means_.sum(axis=1)))
+    mask_normal = gmm.predict(gmm_input) == normal_idx
+
+    neg_loglik = lambda df, data: -np.sum(chi2.logpdf(data, df))
+    d2n_H = dH[mask_normal] ** 2
+    d2n_L = dL[mask_normal] ** 2
+    df_mle_H = float(minimize_scalar(
+        neg_loglik, bounds=(1, 200),
+        method="bounded", args=(d2n_H,)).x)
+    df_mle_L = float(minimize_scalar(
+        neg_loglik, bounds=(1, 200),
+        method="bounded", args=(d2n_L,)).x)
+
+    alpha_beta = (n_feat - 1) / 2
+    n_norm = int(mask_normal.sum())
+    print(f"Pool: {len(XH_pool)} triggers")
+    print(f"GMM: Normal n={n_norm}, "
+          f"Abnormal n={len(XH_pool)-n_norm}")
+    print(f"chi2 MLE: H1 df={df_mle_H:.2f}, "
+          f"L1 df={df_mle_L:.2f} (theory={n_feat})")
+
+    return (
+        {
+            "mu_H": mu_H, "S_H": S_H,
+            "mu_L": mu_L, "S_L": S_L,
+            "df_mle_H": df_mle_H, "df_mle_L": df_mle_L,
+            "alpha_beta": alpha_beta,
+        },
+        {
+            "dH": dH, "dL": dL,
+            "uH": uH, "uL": uL,
+            "gmm": gmm, "mask_normal": mask_normal,
+        },
+    )
+
+
+def classify_triggers(summary_feature, bkg_ref, times, coincl_ids,
+                      fap_c=0.053, alpha_d=0.05):
+    """3-stage classification: C -> GW/NOS, d2 -> BKG/GLC.
+
+    Args:
+        summary_feature: dict with d2H, d2L, C arrays.
+        bkg_ref: output of fit_bkg_reference (whitening + distribution params).
+        times: trigger GPS times.
+        coincl_ids: coincidence cluster IDs (for traceability).
+        fap_c: significance level for C (iFAR=10yr -> 0.053).
+        alpha_d: significance level for d2.
+
+    Returns:
+        pl.DataFrame with columns: coincl_id, times, C, p_C,
+        d2H, p_dH, d2L, p_dL, label, glc_detail.
+    """
+    d2H = summary_feature["d2H"]
+    d2L = summary_feature["d2L"]
+    C = summary_feature["C"]
+
+    ab = bkg_ref["alpha_beta"]
+    tau_C = 2 * beta_dist.ppf(1 - fap_c, ab, ab) - 1
+    tau_H = chi2.ppf(1 - alpha_d, bkg_ref["df_mle_H"])
+    tau_L = chi2.ppf(1 - alpha_d, bkg_ref["df_mle_L"])
+
+    is_gw = C > tau_C
+    is_glc_H = d2H > tau_H
+    is_glc_L = d2L > tau_L
+
+    p_C = beta_dist.sf((C + 1) / 2, ab, ab)
+    p_dH = chi2.sf(d2H, bkg_ref["df_mle_H"])
+    p_dL = chi2.sf(d2L, bkg_ref["df_mle_L"])
+
+    labels = np.where(is_gw, "GW",
+                      np.where(is_glc_H | is_glc_L, "GLC", "BKG"))
+
+    glc_detail = np.array([
+        f"({''.join(p for p, f in [('H', is_glc_H[i]), ('L', is_glc_L[i])] if f)})"
+        if labels[i] == "GLC" else ""
+        for i in range(len(C))
+    ])
+
+    return pl.DataFrame({
+        "coincl_id": coincl_ids,
+        "times": times,
+        "C": C, "p_C": p_C,
+        "d2H": d2H, "p_dH": p_dH,
+        "d2L": d2L, "p_dL": p_dL,
+        "label": labels,
+        "glc_detail": glc_detail,
+    })
+
+
+def is_all_bkg(classif_res):
+    """Determine if the entire batch is BKG per IFO.
+
+    Args:
+        classif_res: pl.DataFrame from classify_triggers.
+
+    Returns:
+        dict with H1/L1 boolean values (True = all BKG for that IFO).
+    """
+    labels = classif_res["label"].to_numpy()
+    details = classif_res["glc_detail"].to_numpy()
+    is_gw = labels == "GW"
+    is_glc = labels == "GLC"
+    unsafe_H = is_gw | (is_glc & np.array(["H" in d for d in details]))
+    unsafe_L = is_gw | (is_glc & np.array(["L" in d for d in details]))
+    return {"H1": not unsafe_H.any(), "L1": not unsafe_L.any()}
+
+
+def ARveto(res_net, triggers, bkg_ref, fap_c=0.053, alpha_d=0.05):
+    """AR feature extraction + classification + BKG determination.
+
+    Skips if no triggers or bkg_ref is None.
+
+    Args:
+        res_net: BEACON pipeline result (Rist with H1/L1 proc).
+        triggers: centroid trigger DataFrame (from filter_centroid_time).
+        bkg_ref: BKG reference from fit_bkg_reference (or None).
+        fap_c: C significance level.
+        alpha_d: d2 significance level.
+
+    Returns:
+        (raw_feature, classif_res, bkg_flag)
+    """
+    if len(triggers) == 0 or bkg_ref is None:
+        return None, None, {"H1": True, "L1": True}
+
+    XH, XL, times, coincl_ids = extract_raw_features(res_net, triggers)
+    summ_feat = get_summary_feature(XH, XL, bkg_ref)
+    classif_res = classify_triggers(
+        summ_feat, bkg_ref, times, coincl_ids, fap_c, alpha_d)
+    bkg_flag = is_all_bkg(classif_res)
+    return {"H1": XH, "L1": XL}, classif_res, bkg_flag
+
+
+def update_deno_params(curr, config, deno_params, isbkg):
+    """Refit seqARIMA parameters if the batch is BKG.
+
+    Args:
+        curr: current batch time series.
+        config: pipeline configuration.
+        deno_params: current seqARIMA parameters.
+        isbkg: whether this detector's batch is BKG.
+
+    Returns:
+        Updated deno_params (refitted if isbkg, otherwise unchanged).
+    """
+    if isbkg:
+        _, deno_params = fit_seqarima(
+            curr, d=config["d"], p=config["p"],
+            q=config["q"], fl=config["fl"],
+            fu=config["fu"], verbose=False,
+        )
+    return deno_params
+
+
+def assign_bin_ids_to_proc(proc, window_size, overlap):
+    """Add bin_id column to proc (reproduces coincide_P0 binning).
+
+    Each proc row is assigned to the latest bin that contains it
+    (unique 1:1 mapping). If proc height < window_size, bin_id = None.
+
+    Args:
+        proc: Polars DataFrame from the pipeline.
+        window_size: coincidence window size in samples.
+        overlap: fractional overlap in [0, 1).
+
+    Returns:
+        pl.DataFrame with bin_id column appended.
+    """
+    n = proc.height
+    step_size = max(1, int((1 - overlap) * window_size))
+    start_indices = np.arange(0, n - window_size + 1, step_size)
+    n_bins = len(start_indices)
+
+    if n_bins == 0:
+        return proc.with_columns(
+            pl.lit(None).cast(pl.Int32).alias("bin_id"))
+
+    indices = np.arange(n)
+    bin_assignments = (
+        np.searchsorted(start_indices, indices, side="right") - 1)
+    bin_assignments = np.clip(bin_assignments, 0, n_bins - 1) + 1
+
+    return proc.with_columns(
+        pl.Series("bin_id", bin_assignments).cast(pl.Int32))
+
+
+# ---------------------------------------------------------------------------
+# Config save / load / consistency
+# ---------------------------------------------------------------------------
+
+def _to_json_safe(val):
+    """Recursively convert a value to a JSON-safe type."""
+    if val is None:
+        return None
+    if isinstance(val, range):
+        return list(val)
+    if isinstance(val, Rist):
+        return {k: _to_json_safe(v)
+                for k, v in zip(val.names, val.values)
+                if k is not None}
+    if isinstance(val, dict):
+        return {k: _to_json_safe(v) for k, v in val.items()}
+    if isinstance(val, (list, tuple)):
+        return [_to_json_safe(v) for v in val]
+    if isinstance(val, np.integer):
+        return int(val)
+    if isinstance(val, np.floating):
+        return float(val)
+    if isinstance(val, np.ndarray):
+        return val.tolist()
+    return val
+
+
+def _serialize_config(config):
+    """Convert config (Rist) to a JSON-safe dict (no file I/O).
+
+    Excludes: bkg_ref (non-serializable numpy arrays).
+    """
+    CONFIG_EXCLUDE_KEYS = {"bkg_ref"}
+    d = {}
+    for name in config.names:
+        if name is None or name in CONFIG_EXCLUDE_KEYS:
+            continue
+        d[name] = _to_json_safe(config[name])
+    return d
+
+
+def save_config(config, path):
+    """Save config as a human-readable JSON file.
+
+    Args:
+        config: pipeline configuration Rist.
+        path: output JSON file path.
+
+    Returns:
+        dict: the saved JSON-safe config dict.
+    """
+    config_dict = _serialize_config(config)
+    with open(path, "w") as f:
+        json.dump(config_dict, f, indent=2, ensure_ascii=False)
+    return config_dict
+
+
+def load_config(path):
+    """Load JSON config and restore types.
+
+    Args:
+        path: path to config.json.
+
+    Returns:
+        dict with properly typed values.
+    """
+    with open(path, "r") as f:
+        d = json.load(f)
+
+    for k in ("d_max", "p", "fl", "nmax", "window_size", "q_max"):
+        if k in d and d[k] is not None:
+            d[k] = int(d[k])
+
+    for k in ("sampling_freq", "scale", "eps", "P_update", "overlap",
+              "fap_c", "alpha_d"):
+        if k in d and d[k] is not None:
+            d[k] = float(d[k])
+
+    if "d" in d and d["d"] is not None and d["d"] != "auto":
+        d["d"] = int(d["d"])
+    if "fu" in d and d["fu"] is not None:
+        d["fu"] = int(d["fu"])
+    if "q" in d and isinstance(d["q"], list):
+        d["q"] = [int(v) for v in d["q"]]
+    if "n_missed" in d and isinstance(d["n_missed"], dict):
+        d["n_missed"] = {k: int(v) for k, v in d["n_missed"].items()}
+    if "smooth_params" in d and isinstance(d["smooth_params"], dict):
+        d["smooth_params"] = {
+            k: float(v) if isinstance(v, (int, float)) else v
+            for k, v in d["smooth_params"].items()
+        }
+
+    return d
+
+
+def _extract_consistency_dict(config_dict):
+    """Extract consistency-relevant keys from a config dict."""
+    CONFIG_CONSISTENCY_KEYS = [
+        "d", "d_max", "p", "q", "fl", "fu",
+        "tbch", "sampling_freq",
+        "nmax", "scale", "method", "eps",
+        "P_update", "smooth", "smooth_params",
+        "window_size", "overlap",
+    ]
+    return {k: config_dict[k]
+            for k in CONFIG_CONSISTENCY_KEYS if k in config_dict}
+
+
+def _check_config_consistency(bkg_ref, config):
+    """Verify Phase 1 <-> Phase 2 config consistency.
+
+    Raises ValueError if any consistency key differs between
+    bkg_ref['config'] and the current config.
+    """
+    if "config" not in bkg_ref:
+        print("[WARNING] bkg_ref has no 'config' key — "
+              "skipping consistency check (legacy bkg_ref)")
+        return
+    CONFIG_CONSISTENCY_KEYS = [
+        "d", "d_max", "p", "q", "fl", "fu",
+        "tbch", "sampling_freq",
+        "nmax", "scale", "method", "eps",
+        "P_update", "smooth", "smooth_params",
+        "window_size", "overlap",
+    ]
+    ref_config = bkg_ref["config"]
+    ref_consistency = _extract_consistency_dict(ref_config)
+    curr_config = _serialize_config(config)
+    curr_consistency = _extract_consistency_dict(curr_config)
+
+    mismatches = []
+    for k in CONFIG_CONSISTENCY_KEYS:
+        ref_val = ref_consistency.get(k)
+        curr_val = curr_consistency.get(k)
+        if ref_val != curr_val:
+            mismatches.append(
+                f"  {k}: bkg_ref={ref_val!r}  vs  current={curr_val!r}")
+
+    if mismatches:
+        msg = ("Phase 1 (BKG pool) <-> Phase 2 (main search) "
+               "config mismatch:\n")
+        msg += "\n".join(mismatches)
+        raise ValueError(msg)

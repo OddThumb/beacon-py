@@ -1663,3 +1663,22 @@ def pred_seqarima(
         out = BandPass(out, fl=fl, fu=fu, verbose=False)
 
     return out
+
+
+# ________________________________________________________________
+# Convenience wrapper: fit + extract parameters
+
+def fit_seqarima(ts_obj, verbose=True, **kwargs):
+    """Fit seqARIMA and extract model parameters in one step.
+
+    Args:
+        ts_obj: beacon ts time series.
+        verbose: print progress.
+        **kwargs: forwarded to seqarima() (d, p, q, fl, fu, etc.).
+
+    Returns:
+        (fit, params): seqarima result and extracted Rist of parameters.
+    """
+    fit = seqarima(ts_obj, **kwargs, verbose=verbose)
+    params = extract_seqarima_params(fit)
+    return fit, params

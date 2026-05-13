@@ -11,21 +11,21 @@ from .etc import Rist
 from .etc import summary
 from . import plot
 from . import Pipe
-from . import featrues
+from . import features
 
 __all__ = [
-    "TS", 
-    "ts", 
-    "FS", 
-    "to_fs", 
-    "DQ", 
-    "seqARIMA", 
-    "IO", 
-    "Calc", 
-    "etc", 
-    "Rist", 
-    "summary", 
-    "plot", 
+    "TS",
+    "ts",
+    "FS",
+    "to_fs",
+    "DQ",
+    "seqARIMA",
+    "IO",
+    "Calc",
+    "etc",
+    "Rist",
+    "summary",
+    "plot",
     "Pipe",
-    "featrues"
+    "features",
 ]

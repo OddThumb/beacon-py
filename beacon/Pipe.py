@@ -1583,7 +1583,9 @@ def pipe_net(
             coinc_res = None
 
     if coinc_res is not None:
-        coinc_clust, triggers = cluster_coinc_triggers(coinc_res)
+        coinc_clust, triggers = cluster_coinc_triggers(
+            coinc_res, p0_thresh = config["P_update"]
+        )
     else:
         coinc_clust = None
         triggers = pl.DataFrame()
@@ -2039,7 +2041,7 @@ def reproduce(
     )
 
 
-def Significance(P: ArrayLike, a: float = 2.3) -> Union[float, NDArray[np.float64]]:
+def Significance(P: ArrayLike, a: float = 1.0) -> Union[float, NDArray[np.float64]]:
     """
     Detection Significance from Probability.
 
@@ -2050,7 +2052,7 @@ def Significance(P: ArrayLike, a: float = 2.3) -> Union[float, NDArray[np.float6
     ----------
     P : ArrayLike
         Probability values (typically 0 <= P <= 1). NaN is preserved.
-    a : float, default 2.3
+    a : float, default 1.0
         Positive scaling factor for the significance.
 
     Returns
@@ -2108,7 +2110,7 @@ def filter_centroid_time(coinc_clust):
     )
 
 
-def cluster_coinc(coinc_res, eps, min_samples):
+def cluster_coinc(coinc_res, eps, min_samples, p0_thresh=0.05):
     """Add Significance column and DBSCAN-cluster the coincidence result.
 
     Args:
@@ -2128,14 +2130,14 @@ def cluster_coinc(coinc_res, eps, min_samples):
             .fill_nan(0)
         ]
     )
+    mask = pl.col("S") > Significance(p0_thresh, a=1)
     db_res = run_dbscan(
-        coinc_res, eps, min_samples,
-        time_col="time_bin", anomaly_col="S",
+        coinc_res, eps, min_samples, time_col="time_bin", anomaly_col="S", mask=mask
     )
     return db_res.rename({"cluster": "coincl_id"})
 
 
-def cluster_coinc_triggers(coinc_res, eps=32 * 15 / 4096, min_samples=1):
+def cluster_coinc_triggers(coinc_res, eps=32 * 15 / 4096, min_samples=1, p0_thresh=0.05):
     """Cluster coincidence result and extract centroid triggers.
 
     Args:
@@ -2147,7 +2149,7 @@ def cluster_coinc_triggers(coinc_res, eps=32 * 15 / 4096, min_samples=1):
         (coinc_clust, triggers) — coinc_clust is the full clustered
         DataFrame; triggers is the centroid rows (or empty DataFrame).
     """
-    coinc_clust = cluster_coinc(coinc_res, eps, min_samples)
+    coinc_clust = cluster_coinc(coinc_res, eps, min_samples, p0_thresh)
     triggers = filter_centroid_time(coinc_clust)
     return coinc_clust, triggers
 

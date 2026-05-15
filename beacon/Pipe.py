@@ -1605,6 +1605,10 @@ def pipe_net(
             delayed(update_deno_params)(
                 batch_net[det], config=config,
                 deno_params=deno_parlist[det], isbkg=bkg_flag[det],
+                proc=res_net_updated[det]["proc"],
+                coinc_clust=coinc_clust,
+                classif_res=classif_res,
+                det=det,
             )
             for det in dets
         )
@@ -2340,17 +2344,139 @@ def ARveto(res_net, triggers, bkg_ref, fap_c=0.053, alpha_d=0.05):
     return {"H1": XH, "L1": XL}, classif_res, bkg_flag
 
 
-def update_deno_params(curr, config, deno_params, isbkg):
-    """Refit seqARIMA parameters if the batch is BKG.
+def _find_unsafe_time_ranges(classif_res, coinc_clust, proc, det,
+                             window_size, overlap):
+    """Identify time ranges occupied by non-BKG (GW/GLC) triggers.
+
+    Traces: classif_res[coincl_id] -> coinc_clust[bin_id] -> proc[time].
+
+    Args:
+        classif_res: classification result (pl.DataFrame).
+        coinc_clust: coincidence cluster DataFrame with coincl_id, bin_id.
+        proc: per-detector proc DataFrame.
+        det: detector name ('H1' or 'L1').
+        window_size: coincide_P0 window size (in samples).
+        overlap: coincide_P0 overlap fraction.
+
+    Returns:
+        Sorted, merged list of (t_start, t_end) GPS time tuples.
+    """
+    labels = classif_res["label"].to_numpy()
+    details = classif_res["glc_detail"].to_numpy()
+    coincl_ids = classif_res["coincl_id"].to_numpy()
+
+    ifo_char = det[0]  # 'H' or 'L'
+    is_gw = labels == "GW"
+    is_glc_det = (labels == "GLC") & np.array([ifo_char in d for d in details])
+    unsafe_mask = is_gw | is_glc_det
+
+    if not unsafe_mask.any():
+        return []
+
+    unsafe_ids = set(coincl_ids[unsafe_mask].tolist())
+
+    # bin_ids occupied by unsafe coincl_ids
+    unsafe_bins = (
+        coinc_clust
+        .filter(pl.col("coincl_id").is_in(list(unsafe_ids)))
+        ["bin_id"].unique().to_list()
+    )
+    if not unsafe_bins:
+        return []
+
+    # Compute time ranges from bin geometry (same as coincide_P0 binning)
+    n = proc.height
+    step_size = max(1, int((1 - overlap) * window_size))
+    start_indices = np.arange(0, n - window_size + 1, step_size)
+    times = proc["time"].to_numpy()
+
+    ranges = []
+    for bid in sorted(unsafe_bins):
+        idx = bid - 1  # 1-indexed -> 0-indexed
+        if 0 <= idx < len(start_indices):
+            row_start = start_indices[idx]
+            row_end = min(row_start + window_size - 1, n - 1)
+            ranges.append((times[row_start], times[row_end]))
+
+    # Merge overlapping ranges
+    ranges.sort()
+    merged = []
+    for t_min, t_max in ranges:
+        if merged and t_min <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], t_max))
+        else:
+            merged.append((t_min, t_max))
+
+    return merged
+
+
+def _longest_clean_ts(curr_ts, gated_ranges, min_duration_s=1.5):
+    """Find the longest trigger-free segment in the current batch.
+
+    Args:
+        curr_ts: current batch time series (ts object).
+        gated_ranges: sorted, merged list of (t_start, t_end) to exclude.
+        min_duration_s: minimum acceptable segment duration in seconds.
+
+    Returns:
+        ts object of the longest clean segment, or None if all < min_duration_s.
+    """
+    fs = curr_ts.sampling_freq
+    t_start = curr_ts.start
+    t_end = t_start + len(curr_ts.data) / fs
+
+    if not gated_ranges:
+        return curr_ts
+
+    # Build clean gaps: regions between gated ranges
+    gaps = []
+    prev_end = t_start
+    for g_start, g_end in gated_ranges:
+        if g_start > prev_end:
+            gaps.append((prev_end, g_start))
+        prev_end = max(prev_end, g_end)
+    if prev_end < t_end:
+        gaps.append((prev_end, t_end))
+
+    if not gaps:
+        return None
+
+    durations = [g[1] - g[0] for g in gaps]
+    best_idx = int(np.argmax(durations))
+
+    if durations[best_idx] < min_duration_s:
+        return None
+
+    g_start, g_end = gaps[best_idx]
+    i_start = max(0, int(round((g_start - t_start) * fs)))
+    i_end = min(len(curr_ts.data), int(round((g_end - t_start) * fs)))
+
+    return ts(curr_ts.data[i_start:i_end], start=g_start, sampling_freq=fs)
+
+
+def update_deno_params(curr, config, deno_params, isbkg,
+                       proc=None, coinc_clust=None, classif_res=None,
+                       det=None, min_clean_s=1.5):
+    """Refit seqARIMA parameters based on BKG classification.
+
+    - isbkg=True: refit on full batch.
+    - isbkg=False: gate non-BKG triggers via coinc_clust tracing,
+      refit on the longest clean segment if >= min_clean_s.
+      Otherwise keep previous params unchanged.
 
     Args:
         curr: current batch time series.
         config: pipeline configuration.
         deno_params: current seqARIMA parameters.
-        isbkg: whether this detector's batch is BKG.
+        isbkg: whether this detector's batch is all-BKG.
+        proc: per-detector proc DataFrame (needed when isbkg=False).
+        coinc_clust: coincidence cluster DataFrame (needed when isbkg=False).
+        classif_res: classification result DataFrame (needed when isbkg=False).
+        det: detector name, e.g. 'H1' (needed when isbkg=False).
+        min_clean_s: minimum clean segment duration in seconds.
 
     Returns:
-        Updated deno_params (refitted if isbkg, otherwise unchanged).
+        Updated deno_params.
     """
     if isbkg:
         _, deno_params = fit_seqarima(
@@ -2358,6 +2484,19 @@ def update_deno_params(curr, config, deno_params, isbkg):
             q=config["q"], fl=config["fl"],
             fu=config["fu"], verbose=False,
         )
+    elif (proc is not None and coinc_clust is not None
+          and classif_res is not None and det is not None):
+        gated_ranges = _find_unsafe_time_ranges(
+            classif_res, coinc_clust, proc, det,
+            config["window_size"], config["overlap"],
+        )
+        clean_seg = _longest_clean_ts(curr, gated_ranges, min_clean_s)
+        if clean_seg is not None:
+            _, deno_params = fit_seqarima(
+                clean_seg, d=config["d"], p=config["p"],
+                q=config["q"], fl=config["fl"],
+                fu=config["fu"], verbose=False,
+            )
     return deno_params
 
 

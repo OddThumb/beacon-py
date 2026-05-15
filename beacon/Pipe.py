@@ -1612,10 +1612,12 @@ def pipe_net(
             )
             for det in dets
         )
-    deno_parlist_upd = dict(zip(dets, results))
+    deno_parlist_upd = {det: r[0] for det, r in zip(dets, results)}
+    fit_status = {det: r[1] for det, r in zip(dets, results)}
 
     return (res_net_updated, prev_batch, coinc_list,
-            classif_res, deno_parlist_upd, raw_feature, bkg_flag)
+            classif_res, deno_parlist_upd, raw_feature, bkg_flag,
+            fit_status)
 
 
 # Streaming batch data into pipe_net
@@ -1632,6 +1634,7 @@ def _get_summary_schema(dets: List[str]) -> pa.Schema:
         ("lambda_a_upd", pa.float64()),
         ("lambda_c_upd", pa.float64()),
         ("bkg_flag", pa.bool_()),
+        ("fit_status", pa.string()),
         ("eta", pa.float64()),
     ])
 
@@ -1642,6 +1645,7 @@ def _build_summary_rows(
     res_net: Rist,
     bkg_flag: dict,
     eta: float,
+    fit_status: dict = None,
 ) -> List[dict]:
     """Build summary rows for current batch (one row per detector, includes bkg_flag)."""
     rows = []
@@ -1681,6 +1685,7 @@ def _build_summary_rows(
             "lambda_a_upd": float(lambda_a_upd) if not np.isnan(lambda_a_upd) else None,
             "lambda_c_upd": float(lambda_c_upd) if not np.isnan(lambda_c_upd) else None,
             "bkg_flag": bkg_flag[det],
+            "fit_status": fit_status[det] if fit_status else None,
             "eta": float(eta),
         })
     return rows
@@ -1766,6 +1771,7 @@ def stream(
         (
             res_net, prev_batch, coinc_lis,
             classif_res, deno_parlist, raw_feature, bkg_flag,
+            fit_status,
         ) = pipe_net(
             batch_net=batch_set[i],
             prev_batch=prev_batch,
@@ -1808,14 +1814,14 @@ def stream(
                 os.path.join(classif_dir, f"batch_{batch_id:04d}.parquet"))
 
         for det in dets:
-            if bkg_flag[det] and deno_parlist[det] is not None:
+            if fit_status[det] != "skip" and deno_parlist[det] is not None:
                 with open(os.path.join(
                         deno_dir,
                         f"batch_{batch_id:04d}_{det}.pkl"), "wb") as f:
                     pickle.dump(deno_parlist[det], f)
 
         summary_rows = _build_summary_rows(
-            batch_id, dets, res_net, bkg_flag, eta)
+            batch_id, dets, res_net, bkg_flag, eta, fit_status)
         summary_writer.write_table(
             pa.Table.from_pylist(summary_rows, schema=summary_schema))
 
@@ -2476,7 +2482,8 @@ def update_deno_params(curr, config, deno_params, isbkg,
         min_clean_s: minimum clean segment duration in seconds.
 
     Returns:
-        Updated deno_params.
+        (deno_params, fit_status) where fit_status is
+        "full" | "gated" | "skip".
     """
     if isbkg:
         _, deno_params = fit_seqarima(
@@ -2484,7 +2491,9 @@ def update_deno_params(curr, config, deno_params, isbkg,
             q=config["q"], fl=config["fl"],
             fu=config["fu"], verbose=False,
         )
-    elif (proc is not None and coinc_clust is not None
+        return deno_params, "full"
+
+    if (proc is not None and coinc_clust is not None
           and classif_res is not None and det is not None):
         gated_ranges = _find_unsafe_time_ranges(
             classif_res, coinc_clust, proc, det,
@@ -2497,7 +2506,9 @@ def update_deno_params(curr, config, deno_params, isbkg,
                 q=config["q"], fl=config["fl"],
                 fu=config["fu"], verbose=False,
             )
-    return deno_params
+            return deno_params, "gated"
+
+    return deno_params, "skip"
 
 
 def assign_bin_ids_to_proc(proc, window_size, overlap):

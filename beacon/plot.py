@@ -889,7 +889,7 @@ def summary(x):
 # ──────────────────────────────────────────────────────────────────────────────
 # AR veto diagnostics & classification plots
 # ──────────────────────────────────────────────────────────────────────────────
-from scipy.stats import chi2, beta as beta_dist, multivariate_normal
+from scipy.stats import chi2, beta as beta_dist, multivariate_normal, gaussian_kde
 
 
 def plot_coinc_clust(coinc_res, tzero=None, dt=None, figsize=(8, 5), ax=None):
@@ -1068,7 +1068,7 @@ def plot_gmm2d(d2_H, d2_L, gmm, mask_normal, iso_dsq=None, ax=None,
     if standalone:
         fig, ax = plt.subplots(figsize=(5.5, 5.5))
 
-    comp_colors = ["red", "blue"]
+    comp_colors = [colors[5], colors[1]]
     comp_labels = ["Normal", "Abnormal"]
     comp_order = [normal_idx, 1 - normal_idx]
 
@@ -1081,11 +1081,6 @@ def plot_gmm2d(d2_H, d2_L, gmm, mask_normal, iso_dsq=None, ax=None,
         ax.contour(
             10**grid_h, 10**grid_l, pdf_vals,
             levels=levels, colors=comp_colors[i], alpha=0.7,
-        )
-        ax.scatter(
-            10 ** gmm.means_[ci, 0], 10 ** gmm.means_[ci, 1],
-            color=comp_colors[i], marker="x", s=100,
-            label=f"{comp_labels[i]} (w={gmm.weights_[ci]:.2f})",
         )
 
     if iso_dsq:
@@ -1100,20 +1095,24 @@ def plot_gmm2d(d2_H, d2_L, gmm, mask_normal, iso_dsq=None, ax=None,
 
     if thresholds:
         if "tau_H" in thresholds:
-            ax.axvline(thresholds["tau_H"], color="red", ls=":", lw=1.5,
-                       alpha=0.7, label=rf"$\tau_H$={thresholds['tau_H']:.1f}")
+            ax.axvline(thresholds["tau_H"], color=colors[6], ls=":", lw=1.5,
+                       alpha=0.85, label=rf"$\tau_H$={thresholds['tau_H']:.1f}")
         if "tau_L" in thresholds:
-            ax.axhline(thresholds["tau_L"], color="blue", ls=":", lw=1.5,
-                       alpha=0.7, label=rf"$\tau_L$={thresholds['tau_L']:.1f}")
+            ax.axhline(thresholds["tau_L"], color=colors[6], ls=":", lw=1.5,
+                       alpha=0.85, label=rf"$\tau_L$={thresholds['tau_L']:.1f}")
 
+    w_norm = gmm.weights_[normal_idx]
+    w_abn = gmm.weights_[1 - normal_idx]
     ax.scatter(
         d2_H[mask_normal], d2_L[mask_normal],
-        alpha=0.25, s=5, color="red", label=f"Normal (n={n_norm})",
+        alpha=0.25, s=5, color=colors[5],
+        label=f"Normal (w={w_norm:.2f}, n={n_norm:,})",
     )
     if show_abnormal:
         ax.scatter(
             d2_H[~mask_normal], d2_L[~mask_normal],
-            alpha=0.25, s=5, color="blue", label=f"Abnormal (n={n_abn})",
+            alpha=0.25, s=5, color=colors[1],
+            label=f"Abnormal (w={w_abn:.2f}, n={n_abn:,})",
         )
     else:
         ax.scatter(
@@ -1194,11 +1193,11 @@ def plot_dist_beta(C, alpha_beta, fap=0.053, ax=None):
 
 
 def plot_bkg_summary(bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05):
-    """BKG pool summary: 2x2 diagnostic plot.
+    """BKG pool summary plot (layout matches plot_det_bkg).
 
-    Layout:
-        [GMM 2D (d^2_H vs d^2_L) | C vs Beta        ]
-        [d^2_H vs chi^2(df_mle_H) | d^2_L vs chi^2(df_mle_L)]
+    Layout (left = C panel, right = corner block):
+        [ C 1D (outline hist + Beta PDF + tau_C) | d^2_H 1D marginal ]
+        [                                        | 2D GMM | d^2_L 1D]
 
     Args:
         bkg_fts: dict with 'dH', 'dL', 'uH', 'uL', 'gmm', 'mask_normal'.
@@ -1207,31 +1206,114 @@ def plot_bkg_summary(bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05):
         alpha_d: significance level for d^2 threshold.
     """
     mask = bkg_fts["mask_normal"]
-    d2H = bkg_fts["dH"][mask] ** 2
-    d2L = bkg_fts["dL"][mask] ** 2
+    dH_all = bkg_fts["dH"]
+    dL_all = bkg_fts["dL"]
+    d2H_all = dH_all ** 2
+    d2L_all = dL_all ** 2
+    d2H_norm = d2H_all[mask]
+    d2L_norm = d2L_all[mask]
     C = (bkg_fts["uH"] * bkg_fts["uL"]).sum(axis=1)
 
-    n_total = len(bkg_fts["dH"])
+    ab = bkg_ref["alpha_beta"]
+    df_H = bkg_ref["df_mle_H"]
+    df_L = bkg_ref["df_mle_L"]
+    tau_C = 2 * beta_dist.ppf(1 - fap_c, ab, ab) - 1
+    tau_H = chi2.ppf(1 - alpha_d, df_H)
+    tau_L = chi2.ppf(1 - alpha_d, df_L)
+
+    n_total = len(dH_all)
     n_norm = int(mask.sum())
+    n_abn = n_total - n_norm
     print(f"BKG Pool: {n_total} triggers")
-    print(f"  GMM: Normal={n_norm}, Abnormal={n_total - n_norm}")
-    print(f"  chi2 MLE: H1 df={bkg_ref['df_mle_H']:.2f}, "
-          f"L1 df={bkg_ref['df_mle_L']:.2f}")
-    print(f"  Beta: a=b={bkg_ref['alpha_beta']:.1f}")
+    print(f"  GMM: Normal={n_norm}, Abnormal={n_abn}")
+    print(f"  chi2 MLE: H1 df={df_H:.2f}, L1 df={df_L:.2f}")
+    print(f"  Beta: a=b={ab:.1f}")
 
-    fig, axes = plt.subplots(2, 2, figsize=(10, 10))
-    for ax in axes.flat:
-        ax.set_box_aspect(1)
-
-    plot_gmm2d(
-        bkg_fts["dH"] ** 2, bkg_fts["dL"] ** 2,
-        bkg_fts["gmm"], bkg_fts["mask_normal"], ax=axes[0, 0],
+    fig = plt.figure(figsize=(14, 7))
+    gs_outer = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.0], wspace=0.15)
+    ax_C = fig.add_subplot(gs_outer[0])
+    gs_corner = gs_outer[1].subgridspec(
+        2, 2, wspace=0.04, hspace=0.04,
+        width_ratios=[3, 1], height_ratios=[1, 3],
     )
-    axes[0, 0].set_aspect("auto")
+    ax_dH = fig.add_subplot(gs_corner[0, 0])
+    ax_2d = fig.add_subplot(gs_corner[1, 0])
+    ax_dL = fig.add_subplot(gs_corner[1, 1])
 
-    plot_dist_beta(C, bkg_ref["alpha_beta"], fap=fap_c, ax=axes[0, 1])
-    plot_dist_chi2(d2H, bkg_ref["df_mle_H"], "H1", alpha=alpha_d, ax=axes[1, 0])
-    plot_dist_chi2(d2L, bkg_ref["df_mle_L"], "L1", alpha=alpha_d, ax=axes[1, 1])
+    # ── ax_2d: 2D GMM ──
+    plot_gmm2d(d2H_all, d2L_all, bkg_fts["gmm"], mask, ax=ax_2d,
+               thresholds={"tau_H": tau_H, "tau_L": tau_L})
+    ax_2d.set_aspect("auto")
+
+    # ── ax_C: C 1D (outline only, OK[5]) ──
+    c_bins = np.linspace(-1, 1, 61)
+    y_grid = np.linspace(-1, 1, 300)
+    ax_C.plot(y_grid, beta_dist.pdf((y_grid + 1) / 2, ab, ab) / 2,
+              "k--", lw=1.5, zorder=4,
+              label=rf"Beta({ab:.1f}, {ab:.1f})")
+    ax_C.axvline(tau_C, color=colors[6], ls=":", lw=1.5, zorder=4,
+                 label=rf"FAP={fap_c:.3f} ($\tau_C$={tau_C:.3f})")
+    ax_C.hist(C, bins=c_bins, density=True,
+              histtype="step", color=colors[5], linewidth=2.0, zorder=10,
+              label=f"NOS (n={len(C):,})")
+    ax_C.set(xlabel="C", ylabel="density")
+    ax_C.legend(fontsize=8)
+    ax_C.grid(True, alpha=0.3)
+
+    # ── ax_dH / ax_dL: d^2 marginals (Normal subset only) ──
+    def _draw_marginal(ax, d2, df_mle, ifo_label, tau, orientation):
+        horiz = (orientation == "horizontal")
+        bins = np.logspace(np.log10(max(d2.min(), 1)),
+                           np.log10(d2.max()), 60)
+        x_grid = np.logspace(np.log10(bins[0]), np.log10(bins[-1]), 300)
+        pdf_vals = chi2.pdf(x_grid, df_mle)
+        if horiz:
+            chi2_line, = ax.plot(pdf_vals, x_grid, "k--", lw=1.5, zorder=4,
+                                 label=rf"$\chi^2$(df={df_mle:.1f})")
+            ax.axhline(tau, color=colors[6], ls=":", lw=1.5, zorder=4)
+            ax.hist(d2, bins=bins, density=True,
+                    histtype="step", orientation="horizontal",
+                    color=colors[5], linewidth=2.0, zorder=10)
+            ax.set(yscale="log", ylabel=rf"$d^2_{{\rm {ifo_label}}}$",
+                   xlabel="density")
+            ax.set_ylim(bins[0], bins[-1])
+            ax.legend([chi2_line], [chi2_line.get_label()],
+                      fontsize=8, loc="lower right")
+        else:
+            chi2_line, = ax.plot(x_grid, pdf_vals, "k--", lw=1.5, zorder=4,
+                                 label=rf"$\chi^2$(df={df_mle:.1f})")
+            ax.axvline(tau, color=colors[6], ls=":", lw=1.5, zorder=4)
+            ax.hist(d2, bins=bins, density=True,
+                    histtype="step", color=colors[5], linewidth=2.0, zorder=10)
+            ax.set(xscale="log", xlabel=rf"$d^2_{{\rm {ifo_label}}}$",
+                   ylabel="density")
+            ax.set_xlim(bins[0], bins[-1])
+            ax.legend([chi2_line], [chi2_line.get_label()],
+                      fontsize=8, loc="upper right")
+        ax.grid(True, which="both", alpha=0.3)
+
+    _draw_marginal(ax_dH, d2H_norm, df_H, "H1", tau_H, "vertical")
+    _draw_marginal(ax_dL, d2L_norm, df_L, "L1", tau_L, "horizontal")
+
+    # axis sharing
+    xlim_2d = ax_2d.get_xlim()
+    ylim_2d = ax_2d.get_ylim()
+    ax_dH.sharex(ax_2d)
+    ax_dL.sharey(ax_2d)
+    ax_dH.set_xlim(xlim_2d)
+    ax_dL.set_ylim(ylim_2d)
+    plt.setp(ax_dH.get_xticklabels(), visible=False)
+    plt.setp(ax_dL.get_yticklabels(), visible=False)
+    ax_dH.set_xlabel("")
+    ax_dL.set_ylabel("")
+
+    fig.suptitle(f"BKG Pool (n={n_norm:,})", fontsize=13)
+    fig.text(
+        0.5, 0.02,
+        "Note: NOS = BKG (Normal subset) + GLC (Abnormal subset).",
+        ha="center", fontsize=9, style="italic", color="dimgray",
+    )
+    plt.show()
 
     fig.suptitle(f"BKG Pool (n={n_total})", fontsize=13)
     plt.tight_layout()
@@ -1535,12 +1617,80 @@ def plot_diag_classified(res_net, coinc_clust, classif_res, ar_seg_dur=32 * 15 /
     plt.show()
 
 
-def plot_det_bkg(classif_res, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05):
+def _draw_d2_panel(ax, d2_train, d2_new, labels, df_mle, ifo_label,
+                   alpha_d, tau, label_colors, orientation="vertical",
+                   show_legend=True):
+    """1D d^2 panel: new BKG+GLC stacked hist + chi^2 PDF + train BKG outline on top.
+
+    orientation:
+        'vertical'   — x=d^2, y=density  (좌상단/우상단용)
+        'horizontal' — x=density, y=d^2  (우하단 marginal용)
+    """
+    horiz = (orientation == "horizontal")
+    all_d2 = np.concatenate([d2_train, d2_new])
+    bins = np.logspace(np.log10(max(all_d2.min(), 1)),
+                       np.log10(all_d2.max()), 60)
+    stack_data, stack_colors, stack_labels = [], [], []
+    for lab in ["BKG", "GLC"]:
+        m = labels == lab
+        n_lab = int(m.sum())
+        if n_lab < 5:
+            continue
+        stack_data.append(d2_new[m])
+        stack_colors.append(label_colors[lab])
+        stack_labels.append(f"new {lab} (n={n_lab:,})")
+    if stack_data:
+        fill_cols = [(*mcolors.to_rgb(c), 0.55) for c in stack_colors]
+        ax.hist(stack_data, bins=bins, density=True, stacked=True,
+                histtype="stepfilled", orientation=orientation,
+                color=fill_cols, edgecolor=stack_colors, linewidth=1.5,
+                label=stack_labels, zorder=2)
+    x_grid = np.logspace(np.log10(bins[0]), np.log10(bins[-1]), 300)
+    pdf_vals = chi2.pdf(x_grid, df_mle)
+    if horiz:
+        ax.plot(pdf_vals, x_grid, "k--", lw=1.5, zorder=4,
+                label=rf"$\chi^2$(df={df_mle:.1f})")
+        ax.axhline(tau, color=colors[6], ls=":", lw=1.5, zorder=4,
+                   label=rf"$\alpha$={alpha_d} ($\tau$={tau:.1f})")
+        ax.hist(d2_train, bins=bins, density=True,
+                histtype="step", orientation="horizontal",
+                color=colors[5], linewidth=2.0, zorder=10,
+                label=f"BKG train (n={len(d2_train):,})")
+        ax.set(yscale="log", ylabel=rf"$d^2_{{\rm {ifo_label}}}$",
+               xlabel="density")
+        ax.set_ylim(bins[0], bins[-1])
+    else:
+        ax.plot(x_grid, pdf_vals, "k--", lw=1.5, zorder=4,
+                label=rf"$\chi^2$(df={df_mle:.1f})")
+        ax.axvline(tau, color=colors[6], ls=":", lw=1.5, zorder=4,
+                   label=rf"$\alpha$={alpha_d} ($\tau$={tau:.1f})")
+        ax.hist(d2_train, bins=bins, density=True,
+                histtype="step", color=colors[5], linewidth=2.0, zorder=10,
+                label=f"BKG train (n={len(d2_train):,})")
+        ax.set(xscale="log", xlabel=rf"$d^2_{{\rm {ifo_label}}}$",
+               ylabel="density")
+        ax.set_xlim(bins[0], bins[-1])
+    if show_legend == "chi2":
+        loc = "lower right" if horiz else "upper right"
+        for line in ax.get_lines():
+            lbl = line.get_label()
+            if lbl.startswith(r"$\chi^2$"):
+                ax.legend([line], [lbl], fontsize=8, loc=loc)
+                break
+    elif show_legend:
+        ax.legend(fontsize=8)
+    ax.grid(True, which="both", alpha=0.3)
+
+
+def plot_det_bkg(classif_res, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05,
+                 kde_grid=80, kde_max_n=10000, seed=42):
     """2x2 classification result plot with BKG reference overlay.
 
     Layout:
-        [2D: Normal contour + NOS triggers | C vs Beta + markers]
-        [d^2_H 1D + markers                | d^2_L 1D + markers]
+        [2D KDE: Normal GMM contour + new BKG/GLC KDE contours
+                                   | C 1D + new BKG/GLC/GW density hist]
+        [d^2_H 1D + new BKG/GLC density hist
+                                   | d^2_L 1D + new BKG/GLC density hist]
 
     Args:
         classif_res: classification result DataFrame.
@@ -1548,13 +1698,15 @@ def plot_det_bkg(classif_res, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05):
         bkg_ref: dict with 'df_mle_H', 'df_mle_L', 'alpha_beta'.
         fap_c: FAP for C threshold.
         alpha_d: significance level for d^2 threshold.
+        kde_grid: 2D KDE grid resolution per axis.
+        kde_max_n: per-class subsample cap for KDE fitting (cost control).
+        seed: RNG seed for subsampling.
     """
     d2H_new = classif_res['d2H'].to_numpy()
     d2L_new = classif_res['d2L'].to_numpy()
     C_new = classif_res['C'].to_numpy()
     labels = classif_res['label'].to_numpy()
     ab = bkg_ref["alpha_beta"]
-    tau_C = 2 * beta_dist.ppf(1 - fap_c, ab, ab) - 1
     tau_H = chi2.ppf(1 - alpha_d, bkg_ref["df_mle_H"])
     tau_L = chi2.ppf(1 - alpha_d, bkg_ref["df_mle_L"])
 
@@ -1563,66 +1715,320 @@ def plot_det_bkg(classif_res, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05):
     d2L_bkg = bkg_fts["dL"][mask_bkg_norm] ** 2
     C_bkg = (bkg_fts["uH"] * bkg_fts["uL"]).sum(axis=1)
 
-    label_colors = {"GW": "limegreen", "GLC": "darkorange", "BKG": "gray"}
+    label_colors = {"GW": colors[3], "GLC": colors[1], "BKG": "gray"}
     n_triggers = len(C_new)
+    rng = np.random.default_rng(seed)
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 12))
-    for ax in axes.flat:
-        ax.set_box_aspect(1)
-
-    plot_gmm2d(
-        bkg_fts["dH"] ** 2, bkg_fts["dL"] ** 2,
-        bkg_fts["gmm"], bkg_fts["mask_normal"],
-        ax=axes[0, 0], show_abnormal=False,
-        thresholds={"tau_H": tau_H, "tau_L": tau_L},
+    fig = plt.figure(figsize=(14, 7))
+    gs_outer = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.0], wspace=0.15)
+    ax_C = fig.add_subplot(gs_outer[0])
+    gs_corner = gs_outer[1].subgridspec(
+        2, 2, wspace=0.04, hspace=0.04,
+        width_ratios=[3, 1], height_ratios=[1, 3],
     )
-    axes[0, 0].set_aspect("auto")
-    for lab in ["BKG", "GLC"]:
-        m = labels == lab
-        if m.any():
-            axes[0, 0].scatter(
-                d2H_new[m], d2L_new[m], s=80, marker="*",
-                color=label_colors[lab], edgecolors="k", linewidths=0.5,
-                label=f"new {lab} (n={m.sum()})", zorder=5,
-            )
-    axes[0, 0].legend(loc="upper left", fontsize=8)
+    ax_dH = fig.add_subplot(gs_corner[0, 0])   # d²_H 1D marginal
+    ax_2d = fig.add_subplot(gs_corner[1, 0])   # 2D contour plane
+    ax_dL = fig.add_subplot(gs_corner[1, 1])   # d²_L 1D marginal (rotated)
 
-    plot_dist_beta(C_bkg, bkg_ref["alpha_beta"], fap=fap_c, ax=axes[0, 1])
+    # ════════ ax_2d (bottom-left): 2D KDE plane (log d^2) ════════
+    ax = ax_2d
+    gmm = bkg_fts["gmm"]
+    normal_idx = int(np.argmin(gmm.means_.sum(axis=1)))
+
+    all_log_h = np.log10(np.concatenate([bkg_fts["dH"] ** 2, d2H_new]))
+    all_log_l = np.log10(np.concatenate([bkg_fts["dL"] ** 2, d2L_new]))
+    pad = 0.1
+    h_lin = np.linspace(all_log_h.min() - pad, all_log_h.max() + pad, kde_grid)
+    l_lin = np.linspace(all_log_l.min() - pad, all_log_l.max() + pad, kde_grid)
+    Hg, Lg = np.meshgrid(h_lin, l_lin)
+    grid_pts = np.vstack([Hg.ravel(), Lg.ravel()])
+
+    # Normal GMM contour (train, outline only 1,2,3σ)
+    rv = multivariate_normal(gmm.means_[normal_idx], gmm.covariances_[normal_idx])
+    pos = np.stack([Hg, Lg], axis=-1)
+    pdf_vals = rv.pdf(pos) * gmm.weights_[normal_idx]
+    normal_levels = sorted(
+        pdf_vals.max() * np.exp(-0.5 * n ** 2) for n in (1, 2, 3)
+    )
+    ax.contour(10 ** Hg, 10 ** Lg, pdf_vals,
+               levels=normal_levels, colors=colors[5],
+               alpha=0.9, linewidths=1.4)
+    ax.plot([], [], color=colors[5], lw=1.5,
+            label=f"BKG train (n={int(mask_bkg_norm.sum()):,})")
+
+    # Single combined KDE (BKG+GLC, GW excluded) — label dominance mask
+    import matplotlib.colors as mcolors
+    def _filled_layers(rgb, alphas=(0.18, 0.32, 0.50)):
+        return [(*rgb, a) for a in alphas]
+
+    sigma_p = {1: 0.6827, 2: 0.9545, 3: 0.9973}
+    m_bkg = labels == "BKG"
+    m_glc = labels == "GLC"
+    n_bkg = int(m_bkg.sum())
+    n_glc = int(m_glc.sum())
+
+    def _maybe_subsample(arr_h, arr_l, n):
+        if n > kde_max_n:
+            idx = rng.choice(n, kde_max_n, replace=False)
+            return arr_h[idx], arr_l[idx]
+        return arr_h, arr_l
+
+    if n_bkg + n_glc >= 5:
+        # combined KDE for contour shape
+        log_h_all = np.log10(np.concatenate([d2H_new[m_bkg], d2H_new[m_glc]]))
+        log_l_all = np.log10(np.concatenate([d2L_new[m_bkg], d2L_new[m_glc]]))
+        log_h_all, log_l_all = _maybe_subsample(log_h_all, log_l_all,
+                                                len(log_h_all))
+        kde_all = gaussian_kde(np.vstack([log_h_all, log_l_all]))
+        kde_all_vals = kde_all(grid_pts).reshape(Hg.shape)
+        sorted_v = np.sort(kde_all_vals.ravel())[::-1]
+        cum = np.cumsum(sorted_v) / sorted_v.sum()
+        sig_levels = sorted(
+            sorted_v[min(int(np.searchsorted(cum, sigma_p[s])),
+                         len(sorted_v) - 1)]
+            for s in (1, 2, 3)
+        )
+        fill_levels = sig_levels + [kde_all_vals.max() * 1.01]
+
+        # label-only KDEs for dominance mask
+        if n_bkg >= 5 and n_glc >= 5:
+            h_b, l_b = _maybe_subsample(np.log10(d2H_new[m_bkg]),
+                                         np.log10(d2L_new[m_bkg]), n_bkg)
+            h_g, l_g = _maybe_subsample(np.log10(d2H_new[m_glc]),
+                                         np.log10(d2L_new[m_glc]), n_glc)
+            kde_b = gaussian_kde(np.vstack([h_b, l_b]))
+            kde_g = gaussian_kde(np.vstack([h_g, l_g]))
+            w_b = kde_b(grid_pts) * n_bkg
+            w_g = kde_g(grid_pts) * n_glc
+            bkg_dominant = (w_b >= w_g).reshape(Hg.shape)
+        else:
+            bkg_dominant = np.ones_like(kde_all_vals, dtype=bool) \
+                if n_bkg >= n_glc else np.zeros_like(kde_all_vals, dtype=bool)
+
+        kde_bkg_part = np.where(bkg_dominant, kde_all_vals, np.nan)
+        kde_glc_part = np.where(~bkg_dominant, kde_all_vals, np.nan)
+
+        rgb_bkg = mcolors.to_rgb(label_colors["BKG"])
+        rgb_glc = mcolors.to_rgb(label_colors["GLC"])
+        ax.contourf(10 ** Hg, 10 ** Lg, kde_bkg_part,
+                    levels=fill_levels, colors=_filled_layers(rgb_bkg))
+        ax.contourf(10 ** Hg, 10 ** Lg, kde_glc_part,
+                    levels=fill_levels,
+                    colors=_filled_layers(rgb_glc,
+                                          alphas=(0.08, 0.16, 0.25)))
+        ax.contour(10 ** Hg, 10 ** Lg, kde_bkg_part,
+                   levels=sig_levels, colors=label_colors["BKG"],
+                   alpha=0.9, linewidths=1.0)
+        ax.contour(10 ** Hg, 10 ** Lg, kde_glc_part,
+                   levels=sig_levels, colors=label_colors["GLC"],
+                   alpha=0.9, linewidths=1.0)
+        ax.plot([], [], color=label_colors["BKG"], lw=4, alpha=0.5,
+                label=f"new BKG (n={n_bkg:,})")
+        ax.plot([], [], color=label_colors["GLC"], lw=4, alpha=0.5,
+                label=f"new GLC (n={n_glc:,})")
+
+    ax.axvline(tau_H, color=colors[6], ls=":", lw=1.5, alpha=0.85,
+               label=rf"$\tau_H$={tau_H:.1f}")
+    ax.axhline(tau_L, color=colors[6], ls=":", lw=1.5, alpha=0.85,
+               label=rf"$\tau_L$={tau_L:.1f}")
+
+    ax.set(xscale="log", yscale="log",
+           xlabel=r"$d_{\rm H1}^2$", ylabel=r"$d_{\rm L1}^2$",
+           xlim=(10 ** h_lin[0], 10 ** h_lin[-1]),
+           ylim=(10 ** l_lin[0], 10 ** l_lin[-1]))
+    ax.grid(True, which="both", ls="-", alpha=0.2)
+    ax.legend(loc="upper left", fontsize=8)
+
+    # ════════ ax_C (top-right): C — stacked new hist, train BKG outline on top ════════
+    ax = ax_C
+    tau_C = 2 * beta_dist.ppf(1 - fap_c, ab, ab) - 1
+    c_bins = np.linspace(-1, 1, 61)
+
+    # stacked: 전체 new를 한 번에 정규화 → 라벨별 색만 분리
+    stack_data, stack_colors, stack_labels = [], [], []
     for lab in ["BKG", "GLC", "GW"]:
         m = labels == lab
-        if m.any():
-            y_pdf = beta_dist.pdf((C_new[m] + 1) / 2, ab, ab) / 2
-            axes[0, 1].scatter(
-                C_new[m], y_pdf, s=80, marker="*",
-                color=label_colors[lab], edgecolors="k", linewidths=0.5,
-                label=f"new {lab}", zorder=5,
-            )
-    axes[0, 1].legend(fontsize=8)
+        n_lab = int(m.sum())
+        if n_lab < 5:
+            continue
+        stack_data.append(C_new[m])
+        stack_colors.append(label_colors[lab])
+        stack_labels.append(f"new {lab} (n={n_lab:,})")
+    if stack_data:
+        fill_cols = [(*mcolors.to_rgb(c), 0.55) for c in stack_colors]
+        ax.hist(stack_data, bins=c_bins, density=True, stacked=True,
+                histtype="stepfilled",
+                color=fill_cols, edgecolor=stack_colors, linewidth=1.5,
+                label=stack_labels, zorder=2)
 
-    plot_dist_chi2(d2H_bkg, bkg_ref["df_mle_H"], "H1", alpha=alpha_d, ax=axes[1, 0])
-    for lab in ["BKG", "GLC"]:
-        m = labels == lab
-        if m.any():
-            y_pdf = chi2.pdf(d2H_new[m], bkg_ref["df_mle_H"])
-            axes[1, 0].scatter(
-                d2H_new[m], y_pdf, s=80, marker="*",
-                color=label_colors[lab], edgecolors="k", linewidths=0.5,
-                label=f"new {lab}", zorder=5,
-            )
-    axes[1, 0].legend(fontsize=8)
+    y_grid = np.linspace(-1, 1, 300)
+    ax.plot(y_grid, beta_dist.pdf((y_grid + 1) / 2, ab, ab) / 2,
+            "k--", lw=1.5, zorder=4,
+            label=rf"Beta({ab:.1f}, {ab:.1f})")
+    ax.axvline(tau_C, color=colors[6], ls=":", lw=1.5, zorder=4,
+               label=rf"FAP={fap_c:.3f} ($\tau_C$={tau_C:.3f})")
 
-    plot_dist_chi2(d2L_bkg, bkg_ref["df_mle_L"], "L1", alpha=alpha_d, ax=axes[1, 1])
-    for lab in ["BKG", "GLC"]:
-        m = labels == lab
-        if m.any():
-            y_pdf = chi2.pdf(d2L_new[m], bkg_ref["df_mle_L"])
-            axes[1, 1].scatter(
-                d2L_new[m], y_pdf, s=80, marker="*",
-                color=label_colors[lab], edgecolors="k", linewidths=0.5,
-                label=f"new {lab}", zorder=5,
-            )
-    axes[1, 1].legend(fontsize=8)
+    ax.hist(C_bkg, bins=c_bins, density=True,
+            histtype="step", color=colors[5], linewidth=2.0, zorder=10,
+            label=f"BKG train (n={len(C_bkg):,})")
+    ax.set(xlabel="C", ylabel="density")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # ════════ ax_dH (top-left): d²_H 1D marginal (chi² legend only) ════════
+    _draw_d2_panel(ax_dH, d2H_bkg, d2H_new, labels,
+                   bkg_ref["df_mle_H"], "H1", alpha_d,
+                   tau_H, label_colors, orientation="vertical",
+                   show_legend="chi2")
+
+    # ════════ ax_dL (bottom-right): d²_L 1D marginal rotated (chi² legend only) ════════
+    _draw_d2_panel(ax_dL, d2L_bkg, d2L_new, labels,
+                   bkg_ref["df_mle_L"], "L1", alpha_d,
+                   tau_L, label_colors, orientation="horizontal",
+                   show_legend="chi2")
+
+    # Axis sharing & label cleanup
+    xlim_2d = ax_2d.get_xlim()
+    ylim_2d = ax_2d.get_ylim()
+    ax_dH.sharex(ax_2d)
+    ax_dL.sharey(ax_2d)
+    ax_dH.set_xlim(xlim_2d)
+    ax_dL.set_ylim(ylim_2d)
+    plt.setp(ax_dH.get_xticklabels(), visible=False)
+    plt.setp(ax_dL.get_yticklabels(), visible=False)
+    ax_dH.set_xlabel("")
+    ax_dL.set_ylabel("")
 
     fig.suptitle(f"Classification (n={n_triggers} triggers)", fontsize=13)
-    plt.tight_layout()
     plt.show()
+
+
+def plot_det_bkg_3d(classif_res, label_colors,
+                    grid_size=50, kde_max_n=8000, seed=42,
+                    sigma_levels=(1, 2),
+                    sigma_alphas=(0.55, 0.25)):
+    """Interactive 3D KDE isosurface in (log10 d²_H, log10 d²_L, C) space.
+
+    Combined distribution surface (per-label max-normalized union) is
+    extracted with marching cubes, then each face is colored by the
+    weighted-KDE-dominant label at its center — i.e. one continuous
+    surface whose color changes by region.
+    """
+    import plotly.graph_objects as go
+    from skimage import measure
+    sigma_p = {1: 0.6827, 2: 0.9545, 3: 0.9973}
+    rng = np.random.default_rng(seed)
+    d2H = classif_res["d2H"].to_numpy()
+    d2L = classif_res["d2L"].to_numpy()
+    C   = classif_res["C"].to_numpy()
+    labels = classif_res["label"].to_numpy()
+
+    h_lin = np.linspace(np.log10(d2H.min()) - 0.1,
+                        np.log10(d2H.max()) + 0.1, grid_size)
+    l_lin = np.linspace(np.log10(d2L.min()) - 0.1,
+                        np.log10(d2L.max()) + 0.1, grid_size)
+    c_lin = np.linspace(-1, 1, grid_size)
+    Hg, Lg, Cg = np.meshgrid(h_lin, l_lin, c_lin, indexing="ij")
+    pts = np.vstack([Hg.ravel(), Lg.ravel(), Cg.ravel()])
+
+    # per-label KDEs (kept as callables for face-center evaluation)
+    kdes, label_counts = {}, {}
+    for lab in ["BKG", "GLC", "GW"]:
+        m = labels == lab
+        n_lab = int(m.sum())
+        if n_lab < 20:
+            continue
+        h = np.log10(d2H[m]); l = np.log10(d2L[m]); c = C[m]
+        if n_lab > kde_max_n:
+            idx = rng.choice(n_lab, kde_max_n, replace=False)
+            h, l, c = h[idx], l[idx], c[idx]
+        kdes[lab] = gaussian_kde(np.vstack([h, l, c]))
+        label_counts[lab] = n_lab
+    label_list = list(kdes.keys())
+    if not label_list:
+        print("No labels with sufficient data."); return
+
+    # per-label density on grid
+    raw_grid = {lab: kdes[lab](pts) for lab in label_list}
+
+    # union surface: max over per-label max-normalized densities
+    union = np.zeros_like(raw_grid[label_list[0]])
+    for lab in label_list:
+        norm = raw_grid[lab] / raw_grid[lab].max()
+        union = np.maximum(union, norm)
+    vol = union.reshape(Hg.shape)
+
+    sv = np.sort(union)[::-1]
+    cum = np.cumsum(sv) / sv.sum()
+    iso_levels = [
+        sv[min(int(np.searchsorted(cum, sigma_p[s])), len(sv) - 1)]
+        for s in sigma_levels
+    ]
+
+    spacing = (
+        (h_lin[-1] - h_lin[0]) / (grid_size - 1),
+        (l_lin[-1] - l_lin[0]) / (grid_size - 1),
+        (c_lin[-1] - c_lin[0]) / (grid_size - 1),
+    )
+    origin = np.array([h_lin[0], l_lin[0], c_lin[0]])
+
+    fig = go.Figure()
+    for j, (s, iso) in enumerate(zip(sigma_levels, iso_levels)):
+        try:
+            verts, faces, _, _ = measure.marching_cubes(
+                vol, level=iso, spacing=spacing
+            )
+        except (RuntimeError, ValueError):
+            continue
+        verts = verts + origin
+
+        # face centers → weighted KDE → dominant label
+        face_centers = verts[faces].mean(axis=1)            # (n_faces, 3)
+        face_dens = np.stack([
+            kdes[lab](face_centers.T) * label_counts[lab]
+            for lab in label_list
+        ], axis=0)                                          # (n_labels, n_faces)
+        face_lab = np.argmax(face_dens, axis=0)
+
+        for i, lab in enumerate(label_list):
+            sel = face_lab == i
+            if not sel.any():
+                continue
+            faces_sel = faces[sel]
+            fig.add_trace(go.Mesh3d(
+                x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
+                i=faces_sel[:, 0], j=faces_sel[:, 1], k=faces_sel[:, 2],
+                color=label_colors[lab],
+                opacity=sigma_alphas[j],
+                flatshading=True,
+                lighting=dict(ambient=0.6, diffuse=0.5),
+                legendgroup=lab,
+                name=(f"{lab} ({','.join(f'{x}σ' for x in sigma_levels)}, "
+                      f"n={label_counts[lab]:,})"),
+                showlegend=(j == 0),
+                hoverinfo="name",
+            ))
+
+    axis_style = dict(
+        backgroundcolor="white",
+        showbackground=True,
+        showgrid=True,
+        gridcolor="lightgray",
+        zeroline=False,
+    )
+    fig.update_layout(
+        scene=dict(
+            xaxis=dict(title="log₁₀ d²_H1", **axis_style),
+            yaxis=dict(title="log₁₀ d²_L1", **axis_style),
+            zaxis=dict(title="C", **axis_style),
+            aspectmode="cube",
+        ),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        title=(f"Classification 3D distribution "
+               f"({','.join(f'{x}σ' for x in sigma_levels)} surfaces, "
+               f"face color = label dominance)"),
+        width=820, height=750,
+        margin=dict(l=0, r=0, t=40, b=0),
+    )
+    fig.show()

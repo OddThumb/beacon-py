@@ -601,6 +601,8 @@ def config_pipe(replace: Optional[Rist] = None, show_config: bool = True) -> Ris
         q=range(1, 21),
         fl=32,
         fu=512,
+        seqarima_mode="on|off",  # "on|off": cache params (default).
+                                  # "on|on": refit every batch (v7 behavior).
 
         # _____Anomaly Clustering_____
         nmax=int(f_sampl * t_batch),
@@ -930,6 +932,50 @@ def concat_ts(prev: ts, curr: ts, n_former: int) -> ts:
     new_data = np.concatenate([prev_part, curr.data])
     new_start = prev.times[-n_former]
     return ts(new_data, start=new_start, sampling_freq=curr.sampling_freq)
+
+
+def get_transient_ranges(classif_res, coinc_clust):
+    """Per-detector transient time ranges from the previous batch.
+
+    GW: shared by both detectors. GLC: per glc_detail tag ((H)/(L)/(HL)).
+    Returns {"H1": [...], "L1": [...]} where each item is
+    {"t_start": gps, "t_end": gps}.
+    """
+    out = {"H1": [], "L1": []}
+    if classif_res is None or coinc_clust is None:
+        return out
+    non_bkg = classif_res.filter(pl.col("label") != "BKG")
+    if len(non_bkg) == 0:
+        return out
+    for row in non_bkg.iter_rows(named=True):
+        cid = row["coincl_id"]
+        ct = coinc_clust.filter(pl.col("coincl_id") == cid)["time_bin"].to_numpy()
+        t_range = {"t_start": float(ct.min()), "t_end": float(ct.max())}
+        if row["label"] == "GW":
+            out["H1"].append(t_range)
+            out["L1"].append(t_range)
+        else:  # GLC
+            if "H" in row["glc_detail"]:
+                out["H1"].append(t_range)
+            if "L" in row["glc_detail"]:
+                out["L1"].append(t_range)
+    return out
+
+
+def compute_n_former(n_default, transient_ranges, curr_start_gps, fs):
+    """Choose n_former so concat[0] doesn't fall inside a previous-batch transient.
+
+    Default = n_default (p+d in on|off, pmax+dmax in on|on). If the check_point
+    (curr_start_gps - n_default/fs) lies inside any transient range, extend
+    back to that transient's t_start so concat[0] sits at the BKG/transient
+    boundary. DBSCAN clustering guarantees check_point can be inside at most
+    one cluster, so a single pass suffices.
+    """
+    check_point = curr_start_gps - n_default / fs
+    for tr in transient_ranges:
+        if tr["t_start"] <= check_point < tr["t_end"]:
+            return int((curr_start_gps - tr["t_start"]) * fs)
+    return n_default
 
 
 def stat_anom(
@@ -1357,7 +1403,9 @@ def update_logic(
 # Main pipeline (for single detector)
 def pipe(
     curr_batch: ts, prev_batch: ts, res_list: Rist,
-    config: Rist, deno_params=None, verb: bool = True,
+    config: Rist, deno_params=None,
+    transient_ranges: Optional[List[dict]] = None,
+    verb: bool = True,
 ) -> Rist:
     """Single-detector pipeline: arch + significance evaluation.
 
@@ -1367,6 +1415,9 @@ def pipe(
         res_list: accumulated results for this detector.
         config: pipeline configuration.
         deno_params: seqARIMA parameters for on|off mode (None = on|on).
+        transient_ranges: previous-batch transient ranges for THIS detector
+            (from `get_transient_ranges`). Used to decide n_former so concat[0]
+            doesn't fall inside a transient. None/empty → no extension.
         verb: verbose output.
     """
     if np.all(np.isnan(curr_batch.data)):
@@ -1377,8 +1428,20 @@ def pipe(
         DQ = config["DQ"]
         P_update = config["P_update"]
 
+        # n_default: on|off → fitted p+d, on|on/첫배치 → tr_overlap(pmax,dmax)
+        if deno_params is not None:
+            n_default = len(deno_params["ar_coef"]) + int(deno_params["d"])
+        else:
+            n_default = n_missed["Mh"]
+        n_former = compute_n_former(
+            n_default=n_default,
+            transient_ranges=transient_ranges or [],
+            curr_start_gps=curr_batch.start,
+            fs=curr_batch.sampling_freq,
+        )
+
         proc = arch(
-            concat_ts(prev=prev_batch, curr=curr_batch, n_former=n_missed["Mh"]),
+            concat_ts(prev=prev_batch, curr=curr_batch, n_former=n_former),
             config, deno_params=deno_params,
         )
         proc = adjust_proc(proc, curr_batch=curr_batch, n_missed=n_missed)
@@ -1515,7 +1578,7 @@ def coincide_P0(
     return grouped
 
 def _run_pipe_worker(det, batch_net, prev_batch, res_list_map,
-                     config, deno_parlist, verbose):
+                     config, deno_parlist, transient_ranges_net, verbose):
     """Worker function for parallel pipe execution."""
     return pipe(
         curr_batch=batch_net[det],
@@ -1523,6 +1586,7 @@ def _run_pipe_worker(det, batch_net, prev_batch, res_list_map,
         res_list=res_list_map[det],
         config=config,
         deno_params=deno_parlist[det],
+        transient_ranges=transient_ranges_net[det],
         verb=verbose,
     )
 
@@ -1533,6 +1597,8 @@ def pipe_net(
     coinc_list: Rist,
     config: Rist,
     deno_parlist: dict,
+    prev_classif_res=None,
+    prev_coinc_clust=None,
     use_thread: bool = True,
     verbose: bool = True,
 ) -> tuple:
@@ -1546,11 +1612,18 @@ def pipe_net(
     res_list_map = {det: res_net[det].copy() for det in dets}
     max_workers = (config.n_workers or len(dets)) if use_thread else 1
 
+    seqarima_mode = config["seqarima_mode"]
+    if seqarima_mode == "on|on":
+        deno_parlist = {det: None for det in dets}
+
+    # 이전 배치 classif/coinc → detector별 transient 범위
+    transient_ranges_net = get_transient_ranges(prev_classif_res, prev_coinc_clust)
+
     with parallel_backend("loky", inner_max_num_threads=1):
         res_list = Parallel(n_jobs=max_workers)(
             delayed(_run_pipe_worker)(
                 det, batch_net, prev_batch, res_list_map,
-                config, deno_parlist, verbose,
+                config, deno_parlist, transient_ranges_net, verbose,
             )
             for det in dets
         )
@@ -1600,20 +1673,24 @@ def pipe_net(
         res_net_updated, triggers, bkg_ref, fap_c, alpha_d
     )
 
-    with parallel_backend("loky", inner_max_num_threads=1):
-        results = Parallel(n_jobs=max_workers)(
-            delayed(update_deno_params)(
-                batch_net[det], config=config,
-                deno_params=deno_parlist[det], isbkg=bkg_flag[det],
-                proc=res_net_updated[det]["proc"],
-                coinc_clust=coinc_clust,
-                classif_res=classif_res,
-                det=det,
+    if seqarima_mode == "on|on":
+        deno_parlist_upd = {det: None for det in dets}
+        fit_status = {det: "skip" for det in dets}
+    else:
+        with parallel_backend("loky", inner_max_num_threads=1):
+            results = Parallel(n_jobs=max_workers)(
+                delayed(update_deno_params)(
+                    batch_net[det], config=config,
+                    deno_params=deno_parlist[det], isbkg=bkg_flag[det],
+                    proc=res_net_updated[det]["proc"],
+                    coinc_clust=coinc_clust,
+                    classif_res=classif_res,
+                    det=det,
+                )
+                for det in dets
             )
-            for det in dets
-        )
-    deno_parlist_upd = {det: r[0] for det, r in zip(dets, results)}
-    fit_status = {det: r[1] for det, r in zip(dets, results)}
+        deno_parlist_upd = {det: r[0] for det, r in zip(dets, results)}
+        fit_status = {det: r[1] for det, r in zip(dets, results)}
 
     return (res_net_updated, prev_batch, coinc_list,
             classif_res, deno_parlist_upd, raw_feature, bkg_flag,
@@ -1762,6 +1839,8 @@ def stream(
         xh_accum, xl_accum = [], []
 
     eta_lis = []
+    prev_classif_res = None
+    prev_coinc_clust = None
     for i in range(len(batch_set)):
         batch_id = i + 1
         if verbose:
@@ -1779,8 +1858,14 @@ def stream(
             coinc_list=coinc_lis,
             config=config,
             deno_parlist=deno_parlist,
+            prev_classif_res=prev_classif_res,
+            prev_coinc_clust=prev_coinc_clust,
             verbose=verbose,
         )
+
+        # n_former 결정용으로 다음 iter에 carry
+        prev_classif_res = classif_res
+        prev_coinc_clust = coinc_lis[-1] if len(coinc_lis) > 0 else None
 
         eta = time.time() - start
         eta_lis.append(eta)
@@ -2642,6 +2727,7 @@ def _extract_consistency_dict(config_dict):
     """Extract consistency-relevant keys from a config dict."""
     CONFIG_CONSISTENCY_KEYS = [
         "d", "d_max", "p", "q", "fl", "fu",
+        "seqarima_mode",
         "tbch", "sampling_freq",
         "nmax", "scale", "method", "eps",
         "P_update", "smooth", "smooth_params",
@@ -2663,6 +2749,7 @@ def _check_config_consistency(bkg_ref, config):
         return
     CONFIG_CONSISTENCY_KEYS = [
         "d", "d_max", "p", "q", "fl", "fu",
+        "seqarima_mode",
         "tbch", "sampling_freq",
         "nmax", "scale", "method", "eps",
         "P_update", "smooth", "smooth_params",

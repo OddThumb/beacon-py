@@ -40,19 +40,22 @@ from .Calc import welch_window  # For Bandpass filter consistent with R version
 
 # ________________________________________________________________
 # Correct shifted phase by filter
-def zero_phasing(data: np.ndarray, H: np.ndarray) -> np.ndarray:
+def zero_phasing(data: np.ndarray, H_func, fs: float) -> np.ndarray:
     """
-    Apply zero-phase correction to filtered data.
+    Apply zero-phase correction to filtered data using zero-padded FFT.
+
+    Uses 2x zero-padding to perform linear (non-circular) convolution,
+    preventing wrap-around edge artifacts that occur with standard
+    circular FFT.
 
     Corrects phase distortion from causal filters (diff, AR) by:
         Y'(z) = Y(z) * e^{-iφ}  where φ = arg(H(z))
 
-    This cancels the phase shift introduced by the filter while
-    preserving the magnitude response |H(z)|.
-
     Args:
         data (np.ndarray): Filtered data (e.g., AR residuals).
-        H (np.ndarray): Filter transfer function.
+        H_func (callable): Function f_array -> H_array that computes the
+            filter transfer function at arbitrary frequency grids.
+        fs (float): Sampling frequency.
 
     Returns:
         np.ndarray: Phase-corrected data with same length as input.
@@ -61,15 +64,20 @@ def zero_phasing(data: np.ndarray, H: np.ndarray) -> np.ndarray:
 
     data = np.asarray(data, dtype=np.float64)
     n = len(data)
+    n_fft = 2 * n  # zero-pad to avoid circular convolution
+
+    # Transfer function on zero-padded frequency grid
+    f = np.fft.fftfreq(n=n_fft, d=1.0 / fs)
+    H = H_func(f)
 
     # Phase response of H(z): φ = arg(H(z))
     phase = np.angle(H)
 
     # Apply phase correction: Y'(z) = Y(z) * e^{-iφ}
-    X_f = fft(data, n=n)
+    X_f = fft(data, n=n_fft)
     X_corrected = X_f * np.exp(-1j * phase)
 
-    return np.real(ifft(X_corrected))
+    return np.real(ifft(X_corrected))[:n]
 
 
 # ________________________________________________________________
@@ -560,12 +568,8 @@ def pred_resid(ts_obj, arcoef, zero_phase=False):
 
     # Zero-phase correction
     if zero_phase:
-        trans_func = H_ar(
-            f=np.fft.fftfreq(n=len(resid), d=1 / ts_obj.sampling_freq),
-            fs=ts_obj.sampling_freq,
-            ar_coef=arcoef,
-        )
-        resid = zero_phasing(resid, trans_func)
+        _fs = ts_obj.sampling_freq
+        resid = zero_phasing(resid, lambda f: H_ar(f, _fs, arcoef), _fs)
 
     new_start = ts_obj.start + p_order / ts_obj.sampling_freq
 
@@ -604,12 +608,8 @@ def sar(
 
     # Zero-phase correction
     if zero_phase:
-        trans_func = H_ar(
-            f=np.fft.fftfreq(n=len(resid), d=1 / ts_obj.sampling_freq),
-            fs=ts_obj.sampling_freq,
-            ar_coef=ar_result.ar,
-        )
-        resid = zero_phasing(resid, trans_func)
+        _fs = ts_obj.sampling_freq
+        resid = zero_phasing(resid, lambda f: H_ar(f, _fs, ar_result.ar), _fs)
 
     # Re-arrange residual w.r.t. the lack of initial data
     new_start = ts_obj.start + p / ts_obj.sampling_freq
@@ -667,16 +667,12 @@ def ear(
     arcoef_list = [fit.ar for fit in ar_fits]
     # Zero-phase correction
     if zero_phase:
+        _fs = ts_obj.sampling_freq
         zp_list = []
         for i in range(len(resids_list)):
             resid = resids_list[i]
             arcoef = arcoef_list[i]
-            trans_func = H_ar(
-                f=np.fft.fftfreq(n=len(resid), d=1 / ts_obj.sampling_freq),
-                fs=ts_obj.sampling_freq,
-                ar_coef=arcoef,
-            )
-            zp_list.append(zero_phasing(resid, trans_func))
+            zp_list.append(zero_phasing(resid, lambda f, _a=arcoef: H_ar(f, _fs, _a), _fs))
         resids_list = zp_list  # overwrite
 
     min_len = min(map(len, resids_list))
@@ -1205,12 +1201,14 @@ def seqarima(
         if is_ear:
             warnings.warn("Zero-phase correction is not supported for ensemble AR. Skipping.")
         else:
-            f = np.fft.fftfreq(n=out.length, d=1 / ts_obj.sampling_freq)
-            H_out = np.ones_like(f, dtype=complex)
-            if hasattr(out, "diff_meta") and out.diff_meta is not None:
-                H_out *= H_diff(f, ts_obj.sampling_freq, out.diff_meta.d_order)
-            H_out *= H_ar(f, ts_obj.sampling_freq, out.ar_meta.ar_coef)
-            out_zp = tsref(zero_phasing(out.data, H_out), out)
+            _fs = ts_obj.sampling_freq
+            _d_order = out.diff_meta.d_order if (hasattr(out, "diff_meta") and out.diff_meta is not None) else None
+            _ar_coef = out.ar_meta.ar_coef
+            if _d_order is not None:
+                H_func = lambda f: H_diff(f, _fs, _d_order) * H_ar(f, _fs, _ar_coef)
+            else:
+                H_func = lambda f: H_ar(f, _fs, _ar_coef)
+            out_zp = tsref(zero_phasing(out.data, H_func, _fs), out)
             inherit_ts_attrs(out, out_zp)
             out = out_zp
 
@@ -1640,12 +1638,14 @@ def pred_seqarima(
         if is_ear:
             warnings.warn("Zero-phase correction is not supported for ensemble AR. Skipping.")
         else:
-            f = np.fft.fftfreq(n=out.length, d=1 / ts_obj.sampling_freq)
-            H_out = np.ones_like(f, dtype=complex)
-            if hasattr(out, "diff_meta") and out.diff_meta is not None:
-                H_out *= H_diff(f, ts_obj.sampling_freq, out.diff_meta.d_order)
-            H_out *= H_ar(f, ts_obj.sampling_freq, out.ar_meta.ar_coef)
-            out_zp = tsref(zero_phasing(out.data, H_out), out)
+            _fs = ts_obj.sampling_freq
+            _d_order = out.diff_meta.d_order if (hasattr(out, "diff_meta") and out.diff_meta is not None) else None
+            _ar_coef = out.ar_meta.ar_coef
+            if _d_order is not None:
+                H_func = lambda f: H_diff(f, _fs, _d_order) * H_ar(f, _fs, _ar_coef)
+            else:
+                H_func = lambda f: H_ar(f, _fs, _ar_coef)
+            out_zp = tsref(zero_phasing(out.data, H_func, _fs), out)
             inherit_ts_attrs(out, out_zp)
             out = out_zp
 

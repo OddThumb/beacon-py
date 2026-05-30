@@ -381,7 +381,7 @@ def burgar(
 
     Args:
         x (array-like): Input time series data.
-        ic (str, optional): Information criterion to select model order ('AIC', 'BIC', 'FPE', 'AICc', 'KIC', 'AKICc'). Defaults to 'AIC'.
+        ic (str, optional): Information criterion to select model order ('AIC', 'BIC', 'FPE', 'AICc', 'KIC', 'AKICc', 'HQIC'). Defaults to 'AIC'. 'HQIC' = Hannan-Quinn (penalty 2*log(log(n)), between AIC and BIC).
         order_max (int, optional): Maximum AR order. If None, computed automatically.
         demean (bool, optional): Whether to remove the mean before fitting. Defaults to True.
         var_method (int, optional): Innovation variance method (1 or 2). Defaults to 2.
@@ -446,6 +446,15 @@ def burgar(
         k = orders + int(demean)
         return n_used * np.log(vars_pred) + 3 * k + (3 * k * (k + 1)) / (n_used - k - 1)
 
+    def HQIC(
+        order_max: int, vars_pred: np.ndarray, n_used: int, demean: bool = False
+    ) -> np.ndarray:
+        # Hannan-Quinn (1979): penalty per parameter = 2*log(log(n)),
+        # which lies strictly between AIC (2) and BIC (log(n)).
+        orders = np.arange(order_max + 1)
+        c = 2.0 * np.log(np.log(n_used))
+        return n_used * np.log(vars_pred) + c * orders + c * int(demean)
+
     x = np.asarray(x, dtype=np.float64).ravel()
     n_used = x.size
 
@@ -493,11 +502,12 @@ def burgar(
             "AICc": AICc,
             "KIC": KIC,
             "AKICc": AKICc,
+            "HQIC": HQIC,
         }.get(ic)
-    
+
         if ic_fun is None:
             raise ValueError(
-                f"Unknown ic: {ic}. Must be one of 'AIC', 'BIC', 'FPE', 'AICc', 'KIC', 'AKICc', or None"
+                f"Unknown ic: {ic}. Must be one of 'AIC', 'BIC', 'FPE', 'AICc', 'KIC', 'AKICc', 'HQIC', or None"
             )
     
         xic = ic_fun(order_max, vars_pred, n_used, demean)

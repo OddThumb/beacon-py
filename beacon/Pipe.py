@@ -472,7 +472,7 @@ def arch(ts_obj: ts, params: Rist, deno_params=None) -> pl.DataFrame:
     if deno_params is None:
         deno = seqarima(
             ts_obj, d=params.d, p=params.p, q=params.q,
-            fl=params.fl, fu=params.fu, verbose=False,
+            fl=params.fl, fu=params.fu, ar_ic=params.ar_ic, verbose=False,
         )
     else:
         deno = pred_seqarima(ts_obj, deno_params, verbose=False)
@@ -603,6 +603,8 @@ def config_pipe(replace: Optional[Rist] = None, show_config: bool = True) -> Ris
         fu=512,
         seqarima_mode="on|off",  # "on|off": cache params (default).
                                   # "on|on": refit every batch (v7 behavior).
+        ar_ic="AIC",  # AR order-selection criterion (burgar ic): "AIC" | "BIC"
+                       # | "HQIC" | "FPE" | "AICc" | "KIC" | "AKICc". p = order_max.
 
         # _____Anomaly Clustering_____
         nmax=int(f_sampl * t_batch),
@@ -2580,7 +2582,7 @@ def update_deno_params(curr, config, deno_params, isbkg,
         _, deno_params = fit_seqarima(
             curr, d=config["d"], p=config["p"],
             q=config["q"], fl=config["fl"],
-            fu=config["fu"], verbose=False,
+            fu=config["fu"], ar_ic=config["ar_ic"], verbose=False,
         )
         return deno_params, "full"
 
@@ -2600,7 +2602,7 @@ def update_deno_params(curr, config, deno_params, isbkg,
             _, deno_params = fit_seqarima(
                 clean_seg, d=config["d"], p=config["p"],
                 q=config["q"], fl=config["fl"],
-                fu=config["fu"], verbose=False,
+                fu=config["fu"], ar_ic=config["ar_ic"], verbose=False,
             )
             return deno_params, "gated"
 
@@ -2738,7 +2740,7 @@ def _extract_consistency_dict(config_dict):
     """Extract consistency-relevant keys from a config dict."""
     CONFIG_CONSISTENCY_KEYS = [
         "d", "d_max", "p", "q", "fl", "fu",
-        "seqarima_mode",
+        "seqarima_mode", "ar_ic",
         "tbch", "sampling_freq",
         "nmax", "scale", "method", "eps",
         "P_update", "smooth", "smooth_params",
@@ -2760,7 +2762,7 @@ def _check_config_consistency(bkg_ref, config):
         return
     CONFIG_CONSISTENCY_KEYS = [
         "d", "d_max", "p", "q", "fl", "fu",
-        "seqarima_mode",
+        "seqarima_mode", "ar_ic",
         "tbch", "sampling_freq",
         "nmax", "scale", "method", "eps",
         "P_update", "smooth", "smooth_params",

@@ -2547,13 +2547,17 @@ def _longest_clean_ts(curr_ts, gated_ranges, min_duration_s=1.5):
 
 def update_deno_params(curr, config, deno_params, isbkg,
                        proc=None, coinc_clust=None, classif_res=None,
-                       det=None, min_clean_s=1.5):
+                       det=None, min_clean_factor=1.5):
     """Refit seqARIMA parameters based on BKG classification.
 
     - isbkg=True: refit on full batch.
-    - isbkg=False: gate non-BKG triggers via coinc_clust tracing,
-      refit on the longest clean segment if >= min_clean_s.
-      Otherwise keep previous params unchanged.
+    - isbkg=False:
+        - If the batch contains any GW trigger, skip the refit entirely
+          so signal is never absorbed into the noise model.
+        - Otherwise gate the GLC-occupied ranges via coinc_clust tracing
+          and refit on the longest clean segment, provided it is at least
+          min_clean_factor * (p / fs) seconds long. If none qualifies,
+          keep previous params unchanged.
 
     Args:
         curr: current batch time series.
@@ -2564,7 +2568,9 @@ def update_deno_params(curr, config, deno_params, isbkg,
         coinc_clust: coincidence cluster DataFrame (needed when isbkg=False).
         classif_res: classification result DataFrame (needed when isbkg=False).
         det: detector name, e.g. 'H1' (needed when isbkg=False).
-        min_clean_s: minimum clean segment duration in seconds.
+        min_clean_factor: minimum clean segment duration as a multiple of the
+            AR filter length p / fs. Scaling with the AR order preserves a
+            fixed samples-per-coefficient margin (default 1.5).
 
     Returns:
         (deno_params, fit_status) where fit_status is
@@ -2580,6 +2586,11 @@ def update_deno_params(curr, config, deno_params, isbkg,
 
     if (proc is not None and coinc_clust is not None
           and classif_res is not None and det is not None):
+        # GW-containing batch: skip the refit entirely (conservative).
+        if (classif_res["label"].to_numpy() == "GW").any():
+            return deno_params, "skip"
+
+        min_clean_s = min_clean_factor * config["p"] / config["sampling_freq"]
         gated_ranges = _find_unsafe_time_ranges(
             classif_res, coinc_clust, proc, det,
             config["window_size"], config["overlap"],

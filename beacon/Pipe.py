@@ -1771,7 +1771,7 @@ def pipe_net(
         for det in dets:
             try:
                 lam = res_net_updated[det]["lamb"][-1]
-                print(f"  {det}: lambda_c={lam['c']:.3f}, lambda_a(mu)={lam['a']:.4f}")
+                print(f"  {det}: lambda_c={lam['c']:.3f}, lambda_a={lam['a']:.4f}")
             except Exception:
                 print(f"  {det}: lambda not available")
 

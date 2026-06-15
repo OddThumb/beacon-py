@@ -81,6 +81,9 @@ def har_mean(x: Sequence[float], na_rm: bool = True) -> float:
     x = np.asarray(x)
     if na_rm:
         x = x[~np.isnan(x)]
+    # Floor at 1e-300 (not finfo.tiny): avoids 1/0 AND keeps sum(1/x) from overflowing
+    # (1/1e-300=1e300, summable over a window; finfo.tiny gives 1/x~4.5e307 -> overflow).
+    x = np.clip(x, 1e-300, None)
     return len(x) / np.sum(1.0 / x) if len(x) > 0 else np.nan
 
 

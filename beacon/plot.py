@@ -1987,14 +1987,26 @@ def plot_batch_dashboard(
             for ax in left_axes:
                 ax.axvspan(t_min, t_max, color=col, alpha=0.25, zorder=0)
 
-        # 라벨 박스: 결정론적 lane 배치 (겹침 없음 + 트리거로 화살표)
+        # 라벨 박스: GW=p_C / GLC=flagged 검출기 p_d (HL이면 둘 다) / BKG=박스 생략
+        def _mt(p):                               # p -> mathtext "m\times10^{e}"
+            if not np.isfinite(p) or p <= 0:
+                return "0"
+            e = int(np.floor(np.log10(p))); m = p / 10.0 ** e
+            return rf"{m:.1f}\times10^{{{e}}}"
         items = []
         for i in range(len(times)):
+            if labels[i] == "BKG":
+                continue                          # background: 음영/마커만, 박스 없음
             if labels[i] == "GW":
-                txt = f"GW\npC={p_C[i]:.1e}"
-            else:
-                txt = (f"{labels[i]}{glc_detail[i]}\n"
-                       f"pdH={p_dH[i]:.1e}\npdL={p_dL[i]:.1e}")
+                txt = f"GW\n$p_C={_mt(p_C[i])}$"  # GW: 결정한 양은 coherence p_C
+            else:                                 # GLC: 글리치로 판정된 검출기의 p_d만
+                det = glc_detail[i]
+                lines = [f"GLC{det}"]
+                if "H" in det:
+                    lines.append(rf"$p_{{d,\mathrm{{H}}}}={_mt(p_dH[i])}$")
+                if "L" in det:
+                    lines.append(rf"$p_{{d,\mathrm{{L}}}}={_mt(p_dL[i])}$")
+                txt = "\n".join(lines)
             items.append(dict(x=times[i] - t0, txt=txt,
                               color=label_colors[labels[i]]))
 

@@ -17,6 +17,7 @@ import pandas as pd
 
 from sklearn.cluster import DBSCAN
 from scipy.stats import poisson
+from scipy.special import lambertw
 
 # For pipe_net in running parallel
 from joblib import Parallel, delayed, parallel_backend
@@ -36,6 +37,8 @@ import pyarrow.parquet as pq
 from scipy.stats import chi2, beta as beta_dist
 from scipy.optimize import minimize_scalar
 from sklearn.mixture import GaussianMixture
+from sklearn.covariance import MinCovDet
+from types import SimpleNamespace
 
 # For seqARIMA on|off denoising
 from .seqARIMA import pred_seqarima, extract_seqarima_params, fit_seqarima
@@ -520,18 +523,39 @@ def pexp_cdf(t: np.ndarray, lam: float) -> np.ndarray:
     return 1 - np.exp(-lam * t)
 
 
+def ztp_mu_from_mean(mean):
+    """ZTP parameter mu from the (untruncated) mean: solve  mean = mu/(1-e^-mu).
+    Closed form via Lambert W:  mu = mean + W0(-mean*e^-mean).  (mean<=1 -> mu=0)"""
+    if mean is None or not np.isfinite(mean) or mean <= 1.0:
+        return 0.0
+    mu = (mean + lambertw(-mean * np.exp(-mean), k=0)).real
+    return float(mu) if (np.isfinite(mu) and mu > 0.0) else 0.0
+
+
 def add_Ppois(df: pl.DataFrame, lambda_a: float) -> pl.DataFrame:
     """
-    Add Poisson CCDF column (Ppois) to cluster summary.
+    Add count-rarity column 'Ppois' = P(N >= N_anom) under the ZERO-TRUNCATED POISSON.
+
+        P(N >= n) = poisson.sf(n-1, mu) / poisson.sf(0, mu),   mu = lambda_a
+
+    N_anom = anomalies per cluster (>=1). lambda_a IS the ZTP parameter mu (already
+    converted from the mean via Lambert W in stat_anom and EMA-tracked), so it is used
+    directly here -- NOT mu = mean (mu != mean for ZTP). P(N>=1)=1 by construction.
 
     Args:
         df (pl.DataFrame): Must include 'N_anom' column.
-        lambda_a (float): Estimated lambda for Poisson.
+        lambda_a (float): ZTP parameter mu (EMA-tracked).
 
     Returns:
         pl.DataFrame: Updated DataFrame with 'Ppois'.
     """
-    ccdf = ppois_anom(df["N_anom"].to_numpy(), lambda_a)
+    mu = float(lambda_a) if (lambda_a is not None and lambda_a == lambda_a and lambda_a > 0.0) else 0.0
+    n = df["N_anom"].to_numpy().astype(float)               # NaN on non-anomaly rows -> preserved
+    if mu <= 0.0:
+        # mu->0 (degenerate ZTP, point mass at 1): P(N>=1)=1, P(N>=2)=0; keep NaN as NaN
+        ccdf = np.where(np.isnan(n), np.nan, np.where(n <= 1.0, 1.0, 0.0))
+    else:
+        ccdf = poisson.sf(n - 1.0, mu) / poisson.sf(0.0, mu)  # ZTP CCDF; n=1 -> 1; NaN preserved
     return df.with_columns(pl.Series("Ppois", ccdf))
 
 
@@ -552,7 +576,9 @@ def add_Pexp(df: pd.DataFrame, lambda_c: float) -> pl.DataFrame:
 
 def add_P0(df: pl.DataFrame) -> pl.DataFrame:
     """
-    Add final combined probability column (P0 = P_NT = Ppois * Pexp) per anomaly.
+    Add combined probability column (P0 = Ppois * Pexp) per anomaly.
+    (Legacy per-cluster significance. The operational pipeline uses add_Pwin,
+    the window-count Poisson significance; add_P0 is kept for reference/diagnostics.)
 
     Args:
         df (pl.DataFrame): Must include 'anomaly', 'Ppois', 'Pexp'.
@@ -570,6 +596,51 @@ def add_P0(df: pl.DataFrame) -> pl.DataFrame:
             )
         ]
     )
+
+
+def add_window_count(df: pl.DataFrame, window_size: int, overlap: float,
+                     edge_guard: int = 1) -> pl.DataFrame:
+    """Assign bin_id (row-based windows, identical to coincide_P0) and per-window
+    distinct-cluster count 'k_win' (spanned to every row).
+
+    The first/last `edge_guard` windows are zeroed: batch-boundary clusters are
+    denoise(seqARIMA warmup)/filter edge transients (artifacts), not background.
+    Used by add_Pwin for the window-count Poisson significance.
+    """
+    df = assign_bin_ids_to_proc(df, window_size, overlap)
+    kw = (df.filter(pl.col("cluster").is_not_null())
+            .group_by("bin_id")
+            .agg(pl.col("cluster").n_unique().alias("k_win")))
+    df = df.join(kw, on="bin_id", how="left").with_columns(
+        pl.col("k_win").fill_null(0).cast(pl.Int64))
+    bmax = df["bin_id"].max()
+    if edge_guard and edge_guard > 0 and bmax is not None:
+        bmax = int(bmax)
+        df = df.with_columns(
+            pl.when((pl.col("bin_id") <= edge_guard)
+                    | (pl.col("bin_id") > bmax - edge_guard))
+              .then(pl.lit(0)).otherwise(pl.col("k_win")).alias("k_win"))
+    return df
+
+
+def add_Pwin(df: pl.DataFrame, lambda_c: float, window_size: int,
+             fs: float) -> pl.DataFrame:
+    """Window-count Poisson significance (Direction B):
+        P0 = P(K >= k_win | Poisson(lambda_c * W)),  W = window_size / fs.
+
+    Ppois' counting unit is the coincidence window (not per-cluster N): K = number
+    of clusters in the window. The cluster-arrival process is Poisson (T ~ Exp),
+    so window counts ~ Poisson(lambda_c * W). Requires 'k_win' (add_window_count).
+    P0 is set on anomaly rows (NaN otherwise) so coincide_P0's har_mean preserves it.
+    """
+    W = window_size / fs
+    mu = float(lambda_c) * W
+    k = df["k_win"].to_numpy().astype(np.int64)   # int cast: avoid uint underflow at k=0
+    p0 = np.clip(poisson.sf(k - 1, mu), float(np.finfo(np.float64).tiny), 1.0)
+    return (df.with_columns(pl.Series("_p0w", p0))
+              .with_columns(pl.when(pl.col("anomaly") == 1)
+                              .then(pl.col("_p0w")).otherwise(np.nan).alias("P0"))
+              .drop("_p0w"))
 
 
 # Pipeline ----
@@ -774,7 +845,7 @@ def init_pipe(dets: List[str] = ["H1", "L1"]):
             Rist(
                 last_tcen=np.nan,
                 stats=Rist(
-                    t_batch=0, N_cl=0, N_anom=0, lambda_a=np.nan, lambda_c=np.nan
+                    t_batch=0, N_cl=0, N_anom=0, N_ge2=0, lambda_a=np.nan, lambda_c=np.nan
                 ),
             )
         ),
@@ -1016,7 +1087,7 @@ def stat_anom(
                     "t_lag": [np.nan],
                 }
             ),
-            stats=Rist(t_batch=0, N_cl=0, N_anom=0, lambda_a=np.nan, lambda_c=np.nan),
+            stats=Rist(t_batch=0, N_cl=0, N_anom=0, N_ge2=0, lambda_a=np.nan, lambda_c=np.nan),
             last_tcen=np.nan,
         )
 
@@ -1041,9 +1112,13 @@ def stat_anom(
     t_batch = len(proc) / sampling_freq
     N_cl = table.height
     N_anom = int(table["N_anom"].sum())
+    N_ge2 = int((table["N_anom"] >= 2).sum())   # clusters with N>=2 (for rho = P(N>=2))
 
     lambda_c = N_cl / t_batch if t_batch > 0 else np.nan
-    lambda_a = N_anom / N_cl if N_cl > 0 else np.nan
+    # lambda_a IS the ZTP parameter mu: compute the (untruncated) mean N = N_anom/N_cl,
+    # then convert via Lambert W (mu = mean + W0(-mean*e^-mean)). Note mu != mean for ZTP.
+    mean_N = N_anom / N_cl if N_cl > 0 else np.nan
+    lambda_a = ztp_mu_from_mean(mean_N)
 
     return Rist(
         table=table,
@@ -1051,6 +1126,7 @@ def stat_anom(
             t_batch=t_batch,
             N_cl=N_cl,
             N_anom=N_anom,
+            N_ge2=N_ge2,
             lambda_c=lambda_c,
             lambda_a=lambda_a,
         ),
@@ -1081,7 +1157,7 @@ def add_Pstats(proc: pl.DataFrame, stat: Rist) -> pl.DataFrame:
     # Step 2: Join 'anomaly' info from proc
     table = table.join(proc.select(["cluster", "anomaly"]), on="cluster", how="left")
 
-    # Step 3: Compute P0 = Ppois * Pexp only for anomaly == 1
+    # Step 3: Compute P0 = Pexp (Pexp-only) for anomaly == 1
     table = add_P0(table)
 
     # Step 4: Merge back to full sample-level data
@@ -1223,12 +1299,14 @@ def update_stat(upd: Rist, cur: Rist) -> Rist:
 
     # total anomaly number
     N_anom_upd = upd.stats["N_anom"] + cur.stats["N_anom"]
+    # total clusters with N>=2 (for rho = P(N>=2))
+    N_ge2_upd = upd.stats["N_ge2"] + cur.stats["N_ge2"]
 
     # Update lambda_c
     lambda_c_upd = N_cl_upd / t_batch_upd if t_batch_upd != 0 else np.nan
 
-    # Update lambda_a
-    lambda_a_upd = N_anom_upd / N_cl_upd if N_cl_upd != 0 else np.nan
+    # Update lambda_a = ZTP mu from cumulative mean (N_anom/N_cl) via Lambert W
+    lambda_a_upd = ztp_mu_from_mean(N_anom_upd / N_cl_upd) if N_cl_upd != 0 else np.nan
 
     # Return (`last_tcen` will be added in pipe(), outside)
     return Rist(
@@ -1236,6 +1314,7 @@ def update_stat(upd: Rist, cur: Rist) -> Rist:
             t_batch=t_batch_upd,
             N_cl=N_cl_upd,
             N_anom=N_anom_upd,
+            N_ge2=N_ge2_upd,
             lambda_c=lambda_c_upd,
             lambda_a=lambda_a_upd,
         )
@@ -1327,12 +1406,14 @@ def update_stat_smooth(
     t_batch_upd = upd.stats["t_batch"] + cur.stats["t_batch"]
     N_cl_upd = upd.stats["N_cl"] + cur.stats["N_cl"]
     N_anom_upd = upd.stats["N_anom"] + cur.stats["N_anom"]
+    N_ge2_upd = upd.stats["N_ge2"] + cur.stats["N_ge2"]   # carried for consistency (lambda_a EMA = rho EMA)
 
     result = Rist(
         stats=Rist(
             t_batch=t_batch_upd,
             N_cl=N_cl_upd,
             N_anom=N_anom_upd,
+            N_ge2=N_ge2_upd,
             lambda_c=lambda_c_upd,
             lambda_a=lambda_a_upd,
             n_batch=n_batch,
@@ -1378,9 +1459,12 @@ def update_logic(
         return updated
     else:
         if P_update is not None:
+            # GATE on timing (Pexp), NOT P0: the null "background = Poisson process"
+            # is a timing property, so membership is judged by the arrival process.
+            # Gating on P0 (count-dependent) selects on N -> collapses rho (feedback).
             proc_filtered = proc.with_columns(
                 [
-                    pl.when(pl.col("P0") < P_update)
+                    pl.when(pl.col("Pexp") < P_update)
                     .then(0)
                     .otherwise(pl.col("anomaly"))
                     .alias("anomaly")
@@ -1457,30 +1541,19 @@ def pipe(
         )
         proc = add_stat(proc, stat_table=current_stat["table"])
 
+        # Significance: P0 = Ppois(N) * Pexp(T)
+        #   Ppois(N) = Geometric count-rarity (run length),  Pexp(T) = Exp waiting time.
         proc = add_Ppois(proc, prev_updated_stat.stats.lambda_a)
         proc = add_Pexp(proc, prev_updated_stat.stats.lambda_c)
         proc = add_P0(proc)
         if DQ is not None:
             proc = add_P0_DQ(proc, DQ)
 
-        updated_stat = update_logic(
-            updated=prev_updated_stat,
-            current=current_stat,
-            P_update=P_update,
-            proc=proc,
-            prev_tcen=prev_tcen,
-            smooth=config["smooth"],
-            smooth_params=config["smooth_params"],
-        )
-        updated_stat["last_tcen"] = get_last_tcen(proc, prev_tcen)
-
+        # NOTE: the lambda/rho update (update_logic) is DEFERRED to pipe_net (post-CA),
+        # so it can exclude SIGNIFICANT coincidences (candidates, incl. GW) from the
+        # background estimate. Here pipe() only records current_stat + proc; the
+        # ustat/lamb for this batch are appended in pipe_net's deferred-update loop.
         rist_append(res_list, "stat", current_stat)
-        rist_append(
-            res_list, "lamb",
-            Rist(a=updated_stat["stats"]["lambda_a"],
-                 c=updated_stat["stats"]["lambda_c"]),
-        )
-        rist_append(res_list, "ustat", updated_stat)
         res_list["proc"] = proc
 
     return res_list
@@ -1633,14 +1706,6 @@ def pipe_net(
     for det in dets:
         prev_batch[det] = batch_net[det]
 
-    if verbose:
-        for det in dets:
-            try:
-                lam = res_net_updated[det]["lamb"][-1]
-                print(f"  {det}: lambda_c={lam['c']:.3f}, lambda_a={lam['a']:.3f}")
-            except Exception:
-                print(f"  {det}: lambda not available")
-
     if any(is_all_nan(res_net_updated[det]["proc"]) for det in dets):
         coinc_res = None
     else:
@@ -1666,6 +1731,49 @@ def pipe_net(
         triggers = pl.DataFrame()
 
     coinc_list.append(coinc_clust)
+
+    # --- Deferred lambda/rho update (post-CA): non-coincident background only ---
+    # Exclude clusters in SIGNIFICANT coincidence bins (coincl_id != null = candidates
+    # that go to AV, including GW). Then update_logic applies the Pexp gate. So the
+    # noise model (rho=P(N>=2), lambda_c) is estimated from non-candidate (background-
+    # bulk), background-timing clusters only -> GW (coincident) cannot contaminate it.
+    ws = config["window_size"]; ov = config["overlap"]; p_upd = config["P_update"]
+    if coinc_clust is not None and "coincl_id" in coinc_clust.columns:
+        cobins = (coinc_clust.filter(pl.col("coincl_id").is_not_null())["bin_id"]
+                  .unique().to_list())
+    else:
+        cobins = []
+    for det in dets:
+        rl = res_net_updated[det]
+        if is_all_nan(rl["proc"]):
+            continue  # NaN batch: ustat/lamb already appended by append_result_NaN
+        proc = rl["proc"]
+        current_stat = rl["stat"][-1]
+        prev_ustat = rl["ustat"][-1]   # previous batch (pipe() deferred this batch)
+        prev_tcen = prev_ustat["last_tcen"]
+        if cobins:
+            procg = assign_bin_ids_to_proc(proc, ws, ov).with_columns(
+                pl.when(pl.col("bin_id").is_in(cobins)).then(0)
+                  .otherwise(pl.col("anomaly")).alias("anomaly"))
+        else:
+            procg = proc
+        new_ustat = update_logic(
+            updated=prev_ustat, current=current_stat, P_update=p_upd,
+            proc=procg, prev_tcen=prev_tcen,
+            smooth=config["smooth"], smooth_params=config["smooth_params"])
+        new_ustat["last_tcen"] = get_last_tcen(proc, prev_tcen)
+        rist_append(rl, "ustat", new_ustat)
+        rist_append(rl, "lamb", Rist(a=new_ustat["stats"]["lambda_a"],
+                                     c=new_ustat["stats"]["lambda_c"]))
+
+    # verbose AFTER the deferred update (shows THIS batch's mu; also confirms the append/save)
+    if verbose:
+        for det in dets:
+            try:
+                lam = res_net_updated[det]["lamb"][-1]
+                print(f"  {det}: lambda_c={lam['c']:.3f}, lambda_a(mu)={lam['a']:.4f}")
+            except Exception:
+                print(f"  {det}: lambda not available")
 
     bkg_ref = config["bkg_ref"]
     fap_c = config["fap_c"]
@@ -2166,6 +2274,9 @@ def Significance(P: ArrayLike, a: float = 1.0) -> Union[float, NDArray[np.float6
     """
     # Convert to ndarray (keeps NaN as NaN; log10 handles edge cases)
     p = np.asarray(P, dtype=np.float64)
+    # Floor p to smallest positive double to avoid S=+inf from p==0 (underflow).
+    # NaN is preserved by np.clip; S is capped at ~307 (>> any real-event S).
+    p = np.clip(p, np.finfo(np.float64).tiny, None)
     s = -a * np.log10(p)
     # Preserve scalar return for scalar input
     return s.item() if s.ndim == 0 else s
@@ -2284,13 +2395,24 @@ def collect_bkg_pool(batch_iter, feat_dim=32):
     return XH_pool, XL_pool
 
 
-def fit_bkg_reference(XH_pool, XL_pool, n_feat=32):
-    """Fit BKG reference: whitening + 2D GMM Normal separation + per-IFO chi2 MLE.
+def fit_bkg_reference(XH_pool, XL_pool, n_feat=32,
+                      mcd_support_fraction=0.5, mcd_chi2_q=0.975):
+    """Fit BKG reference: whitening + MCD robust core + per-IFO chi2 MLE.
+
+    The normal (BKG) core in (log10 d2H, log10 d2L) space is extracted with a
+    Minimum Covariance Determinant (MCD) robust estimator instead of a
+    2-component GMM. Without a low-frequency highpass the d2 cloud is
+    cross-shaped (a circular core plus two orthogonal single-detector glitch
+    arms), which a fixed-K GMM splits along the axes rather than isolating the
+    core. MCD locks onto the densest elliptical core and rejects the arms via a
+    chi2(2) robust-Mahalanobis cut, so the outliers drop off on their own.
 
     Args:
         XH_pool: H1 AR feature pool, shape (n, n_feat).
         XL_pool: L1 AR feature pool, shape (n, n_feat).
         n_feat: feature dimension (for Beta alpha/beta parameter).
+        mcd_support_fraction: MCD raw support fraction (0.5 = max breakdown).
+        mcd_chi2_q: chi2(2) quantile for the robust inlier (core) cut.
 
     Returns:
         (bkg_ref, bkg_fts) — bkg_ref contains whitening params and
@@ -2302,10 +2424,26 @@ def fit_bkg_reference(XH_pool, XL_pool, n_feat=32):
     dH, uH = decompose_vector(ZH)
     dL, uL = decompose_vector(ZL)
 
-    gmm_input = np.column_stack([np.log10(dH**2), np.log10(dL**2)])
-    gmm = GaussianMixture(n_components=2, random_state=42).fit(gmm_input)
-    normal_idx = int(np.argmin(gmm.means_.sum(axis=1)))
-    mask_normal = gmm.predict(gmm_input) == normal_idx
+    # Robust core extraction in log10(d^2) space (replaces 2-component GMM).
+    log_d2 = np.column_stack([np.log10(dH**2), np.log10(dL**2)])
+    mcd_raw = MinCovDet(support_fraction=mcd_support_fraction,
+                        random_state=42).fit(log_d2)
+    rob_maha2 = mcd_raw.mahalanobis(log_d2)            # ~ chi2(2) within the core
+    mask_normal = rob_maha2 < chi2.ppf(mcd_chi2_q, df=2)
+
+    # Drop-in 2-component object so the diagnostic plots (plot_d2_plane,
+    # plot_classif_summary) keep working unmodified: component 0 = MCD core,
+    # component 1 = empirical Gaussian of the rejected outliers.
+    abn = ~mask_normal
+    rej = log_d2[abn]
+    mu_abn = rej.mean(axis=0) if abn.any() else mcd_raw.location_
+    cov_abn = np.cov(rej.T) if int(abn.sum()) > 2 else mcd_raw.covariance_
+    mcd = SimpleNamespace(
+        means_=np.stack([mcd_raw.location_, mu_abn]),
+        covariances_=np.stack([mcd_raw.covariance_, np.atleast_2d(cov_abn)]),
+        weights_=np.array([mask_normal.mean(), abn.mean()]),
+        raw=mcd_raw,
+    )
 
     neg_loglik = lambda df, data: -np.sum(chi2.logpdf(data, df))
     d2n_H = dH[mask_normal] ** 2
@@ -2320,8 +2458,8 @@ def fit_bkg_reference(XH_pool, XL_pool, n_feat=32):
     alpha_beta = (n_feat - 1) / 2
     n_norm = int(mask_normal.sum())
     print(f"Pool: {len(XH_pool)} triggers")
-    print(f"GMM: Normal n={n_norm}, "
-          f"Abnormal n={len(XH_pool)-n_norm}")
+    print(f"MCD: Core n={n_norm} ({100*mask_normal.mean():.1f}%), "
+          f"Rejected n={len(XH_pool)-n_norm}")
     print(f"chi2 MLE: H1 df={df_mle_H:.2f}, "
           f"L1 df={df_mle_L:.2f} (theory={n_feat})")
 
@@ -2335,7 +2473,7 @@ def fit_bkg_reference(XH_pool, XL_pool, n_feat=32):
         {
             "dH": dH, "dL": dL,
             "uH": uH, "uL": uL,
-            "gmm": gmm, "mask_normal": mask_normal,
+            "mcd": mcd, "mask_normal": mask_normal,
         },
     )
 

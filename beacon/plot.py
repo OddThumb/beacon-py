@@ -13,6 +13,7 @@ from cycler import cycler
 from cmap import Colormap
 import matplotlib.colors as mcolors
 from adjustText import adjust_text
+from pathlib import Path
 
 try:
     from pycbc.types import TimeSeries
@@ -1033,106 +1034,6 @@ def plot_diag(res_net, coinc):
     plt.show()
 
 
-def plot_gmm2d(d2_H, d2_L, gmm, mask_normal, iso_dsq=None, ax=None,
-               show_abnormal=True, thresholds=None):
-    """2D GMM contours + data scatter on (d^2_H, d^2_L) plane.
-
-    Args:
-        d2_H: d^2 values for H1.
-        d2_L: d^2 values for L1.
-        gmm: fitted GaussianMixture (2 components, log10 space).
-        mask_normal: boolean mask for normal component.
-        iso_dsq: list of iso-d^2_joint values for contour lines.
-        ax: optional axes.
-        show_abnormal: whether to show abnormal component contours.
-        thresholds: dict with 'tau_H' and/or 'tau_L' threshold values.
-    """
-    n_norm, n_abn = int(mask_normal.sum()), int((~mask_normal).sum())
-    normal_idx = int(np.argmin(gmm.means_.sum(axis=1)))
-
-    pad = 0.2
-    log_range_h = np.linspace(
-        np.log10(d2_H.min()) - pad, np.log10(d2_H.max()) + pad, 200
-    )
-    log_range_l = np.linspace(
-        np.log10(d2_L.min()) - pad, np.log10(d2_L.max()) + pad, 200
-    )
-    grid_h, grid_l = np.meshgrid(log_range_h, log_range_l)
-    pos = np.stack([grid_h, grid_l], axis=-1)
-
-    xlo, xhi = 10 ** log_range_h[0], 10 ** log_range_h[-1]
-    ylo, yhi = 10 ** log_range_l[0], 10 ** log_range_l[-1]
-    lo, hi = min(xlo, ylo), max(xhi, yhi)
-
-    standalone = ax is None
-    if standalone:
-        fig, ax = plt.subplots(figsize=(5.5, 5.5))
-
-    comp_colors = [colors[5], colors[1]]
-    comp_labels = ["Normal", "Abnormal"]
-    comp_order = [normal_idx, 1 - normal_idx]
-
-    for i, ci in enumerate(comp_order):
-        if i == 1 and not show_abnormal:
-            continue
-        rv = multivariate_normal(gmm.means_[ci], gmm.covariances_[ci])
-        pdf_vals = rv.pdf(pos) * gmm.weights_[ci]
-        levels = [pdf_vals.max() * np.exp(-0.5 * n**2) for n in [3, 2, 1]]
-        ax.contour(
-            10**grid_h, 10**grid_l, pdf_vals,
-            levels=levels, colors=comp_colors[i], alpha=0.7,
-        )
-
-    if iso_dsq:
-        for S in iso_dsq:
-            d2h_line = np.linspace(0.01, S - 0.01, 500)
-            d2l_line = S - d2h_line
-            ax.plot(d2h_line, d2l_line, color="green", ls="--", lw=1.5, alpha=0.6)
-            ax.text(
-                S, lo, rf"$\Sigma={S}$", fontsize=7, color="green",
-                rotation=-80, ha="center", va="bottom", clip_on=True,
-            )
-
-    if thresholds:
-        if "tau_H" in thresholds:
-            ax.axvline(thresholds["tau_H"], color=colors[6], ls=":", lw=1.5,
-                       alpha=0.85, label=rf"$\tau_H$={thresholds['tau_H']:.1f}")
-        if "tau_L" in thresholds:
-            ax.axhline(thresholds["tau_L"], color=colors[6], ls=":", lw=1.5,
-                       alpha=0.85, label=rf"$\tau_L$={thresholds['tau_L']:.1f}")
-
-    w_norm = gmm.weights_[normal_idx]
-    w_abn = gmm.weights_[1 - normal_idx]
-    ax.scatter(
-        d2_H[mask_normal], d2_L[mask_normal],
-        alpha=0.25, s=5, color=colors[5],
-        label=f"Normal (w={w_norm:.2f}, n={n_norm:,})",
-    )
-    if show_abnormal:
-        ax.scatter(
-            d2_H[~mask_normal], d2_L[~mask_normal],
-            alpha=0.25, s=5, color=colors[1],
-            label=f"Abnormal (w={w_abn:.2f}, n={n_abn:,})",
-        )
-    else:
-        ax.scatter(
-            d2_H[~mask_normal], d2_L[~mask_normal],
-            alpha=0.1, s=3, color="gray",
-        )
-
-    ax.set(
-        xscale="log", yscale="log",
-        xlabel=r"$d_{\rm H1}^2$", ylabel=r"$d_{\rm L1}^2$",
-        xlim=(lo, hi), ylim=(lo, hi), aspect="equal",
-    )
-    ax.grid(True, which="both", ls="-", alpha=0.2)
-    ax.legend(loc="upper left", fontsize=9)
-
-    if standalone:
-        plt.tight_layout()
-        plt.show()
-
-
 def plot_dist_chi2(d2, df_mle, ifo_label, alpha=0.05, ax=None):
     """Histogram of d^2 with chi^2(df_mle) PDF overlay and threshold line.
 
@@ -1190,134 +1091,6 @@ def plot_dist_beta(C, alpha_beta, fap=0.053, ax=None):
     ax.set(xlabel="C", ylabel="density")
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
-
-
-def plot_bkg_summary(bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05):
-    """BKG pool summary plot (layout matches plot_det_bkg).
-
-    Layout (left = C panel, right = corner block):
-        [ C 1D (outline hist + Beta PDF + tau_C) | d^2_H 1D marginal ]
-        [                                        | 2D GMM | d^2_L 1D]
-
-    Args:
-        bkg_fts: dict with 'dH', 'dL', 'uH', 'uL', 'gmm', 'mask_normal'.
-        bkg_ref: dict with 'df_mle_H', 'df_mle_L', 'alpha_beta'.
-        fap_c: FAP for C threshold.
-        alpha_d: significance level for d^2 threshold.
-    """
-    mask = bkg_fts["mask_normal"]
-    dH_all = bkg_fts["dH"]
-    dL_all = bkg_fts["dL"]
-    d2H_all = dH_all ** 2
-    d2L_all = dL_all ** 2
-    d2H_norm = d2H_all[mask]
-    d2L_norm = d2L_all[mask]
-    C = (bkg_fts["uH"] * bkg_fts["uL"]).sum(axis=1)
-
-    ab = bkg_ref["alpha_beta"]
-    df_H = bkg_ref["df_mle_H"]
-    df_L = bkg_ref["df_mle_L"]
-    tau_C = 2 * beta_dist.ppf(1 - fap_c, ab, ab) - 1
-    tau_H = chi2.ppf(1 - alpha_d, df_H)
-    tau_L = chi2.ppf(1 - alpha_d, df_L)
-
-    n_total = len(dH_all)
-    n_norm = int(mask.sum())
-    n_abn = n_total - n_norm
-    print(f"BKG Pool: {n_total} triggers")
-    print(f"  GMM: Normal={n_norm}, Abnormal={n_abn}")
-    print(f"  chi2 MLE: H1 df={df_H:.2f}, L1 df={df_L:.2f}")
-    print(f"  Beta: a=b={ab:.1f}")
-
-    fig = plt.figure(figsize=(14, 7))
-    gs_outer = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.0], wspace=0.15)
-    ax_C = fig.add_subplot(gs_outer[0])
-    gs_corner = gs_outer[1].subgridspec(
-        2, 2, wspace=0.04, hspace=0.04,
-        width_ratios=[3, 1], height_ratios=[1, 3],
-    )
-    ax_dH = fig.add_subplot(gs_corner[0, 0])
-    ax_2d = fig.add_subplot(gs_corner[1, 0])
-    ax_dL = fig.add_subplot(gs_corner[1, 1])
-
-    # ── ax_2d: 2D GMM ──
-    plot_gmm2d(d2H_all, d2L_all, bkg_fts["gmm"], mask, ax=ax_2d,
-               thresholds={"tau_H": tau_H, "tau_L": tau_L})
-    ax_2d.set_aspect("auto")
-
-    # ── ax_C: C 1D (outline only, OK[5]) ──
-    c_bins = np.linspace(-1, 1, 61)
-    y_grid = np.linspace(-1, 1, 300)
-    ax_C.plot(y_grid, beta_dist.pdf((y_grid + 1) / 2, ab, ab) / 2,
-              "k--", lw=1.5, zorder=4,
-              label=rf"Beta({ab:.1f}, {ab:.1f})")
-    ax_C.axvline(tau_C, color=colors[6], ls=":", lw=1.5, zorder=4,
-                 label=rf"FAP={fap_c:.3f} ($\tau_C$={tau_C:.3f})")
-    ax_C.hist(C, bins=c_bins, density=True,
-              histtype="step", color=colors[5], linewidth=2.0, zorder=10,
-              label=f"NOS (n={len(C):,})")
-    ax_C.set(xlabel="C", ylabel="density")
-    ax_C.legend(fontsize=8)
-    ax_C.grid(True, alpha=0.3)
-
-    # ── ax_dH / ax_dL: d^2 marginals (Normal subset only) ──
-    def _draw_marginal(ax, d2, df_mle, ifo_label, tau, orientation):
-        horiz = (orientation == "horizontal")
-        bins = np.logspace(np.log10(max(d2.min(), 1)),
-                           np.log10(d2.max()), 60)
-        x_grid = np.logspace(np.log10(bins[0]), np.log10(bins[-1]), 300)
-        pdf_vals = chi2.pdf(x_grid, df_mle)
-        if horiz:
-            chi2_line, = ax.plot(pdf_vals, x_grid, "k--", lw=1.5, zorder=4,
-                                 label=rf"$\chi^2$(df={df_mle:.1f})")
-            ax.axhline(tau, color=colors[6], ls=":", lw=1.5, zorder=4)
-            ax.hist(d2, bins=bins, density=True,
-                    histtype="step", orientation="horizontal",
-                    color=colors[5], linewidth=2.0, zorder=10)
-            ax.set(yscale="log", ylabel=rf"$d^2_{{\rm {ifo_label}}}$",
-                   xlabel="density")
-            ax.set_ylim(bins[0], bins[-1])
-            ax.legend([chi2_line], [chi2_line.get_label()],
-                      fontsize=8, loc="lower right")
-        else:
-            chi2_line, = ax.plot(x_grid, pdf_vals, "k--", lw=1.5, zorder=4,
-                                 label=rf"$\chi^2$(df={df_mle:.1f})")
-            ax.axvline(tau, color=colors[6], ls=":", lw=1.5, zorder=4)
-            ax.hist(d2, bins=bins, density=True,
-                    histtype="step", color=colors[5], linewidth=2.0, zorder=10)
-            ax.set(xscale="log", xlabel=rf"$d^2_{{\rm {ifo_label}}}$",
-                   ylabel="density")
-            ax.set_xlim(bins[0], bins[-1])
-            ax.legend([chi2_line], [chi2_line.get_label()],
-                      fontsize=8, loc="upper right")
-        ax.grid(True, which="both", alpha=0.3)
-
-    _draw_marginal(ax_dH, d2H_norm, df_H, "H1", tau_H, "vertical")
-    _draw_marginal(ax_dL, d2L_norm, df_L, "L1", tau_L, "horizontal")
-
-    # axis sharing
-    xlim_2d = ax_2d.get_xlim()
-    ylim_2d = ax_2d.get_ylim()
-    ax_dH.sharex(ax_2d)
-    ax_dL.sharey(ax_2d)
-    ax_dH.set_xlim(xlim_2d)
-    ax_dL.set_ylim(ylim_2d)
-    plt.setp(ax_dH.get_xticklabels(), visible=False)
-    plt.setp(ax_dL.get_yticklabels(), visible=False)
-    ax_dH.set_xlabel("")
-    ax_dL.set_ylabel("")
-
-    fig.suptitle(f"BKG Pool (n={n_norm:,})", fontsize=13)
-    fig.text(
-        0.5, 0.02,
-        "Note: NOS = BKG (Normal subset) + GLC (Abnormal subset).",
-        ha="center", fontsize=9, style="italic", color="dimgray",
-    )
-    plt.show()
-
-    fig.suptitle(f"BKG Pool (n={n_total})", fontsize=13)
-    plt.tight_layout()
-    plt.show()
 
 
 def plot_3d(new_det, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05):
@@ -1491,141 +1264,176 @@ def plot_3d(new_det, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05):
     fig.show()
 
 
-def plot_diag_classified(res_net, coinc_clust, classif_res, ar_seg_dur=32 * 15 / 4096):
-    """Diagnostic dashboard with classification overlay.
+# ============================================================
+# BKG null-reference & classification diagnostics
+# (registered 2026-06-15; schema key bkg_fts['mcd'])
+# ============================================================
 
-    Extends plot_diag with trigger shading (3 panels) and classification
-    labels with p-value annotations.
+def plot_d2_plane(d2_H, d2_L, mcd, mask_normal, iso_dsq=None, ax=None,
+               show_abnormal=True):
+    n_norm, n_abn = int(mask_normal.sum()), int((~mask_normal).sum())
+    normal_idx = int(np.argmin(mcd.means_.sum(axis=1)))
 
-    Args:
-        res_net: BEACON pipeline result Rist (H1/L1).
-        coinc_clust: clustered coincidence DataFrame.
-        classif_res: classification result DataFrame.
-        ar_seg_dur: AR segment duration in seconds (for shading width).
-    """
+    pad = 0.2
+    log_h = np.linspace(np.log10(d2_H.min())-pad, np.log10(d2_H.max())+pad, 200)
+    log_l = np.linspace(np.log10(d2_L.min())-pad, np.log10(d2_L.max())+pad, 200)
+    Gh, Gl = np.meshgrid(log_h, log_l)
+    pos = np.stack([Gh, Gl], axis=-1)
+    xlo, xhi = 10**log_h[0], 10**log_h[-1]
+    ylo, yhi = 10**log_l[0], 10**log_l[-1]
+    lo, hi = min(xlo, ylo), max(xhi, yhi)
+    standalone = ax is None
+    if standalone:
+        fig, ax = plt.subplots(figsize=(5.5, 5.5))
 
-    plot_data = pl.DataFrame([
-        {"index": i, "Detector": det,
-         "lambda_c": it["stats"]["lambda_c"],
-         "lambda_a": it["stats"]["lambda_a"]}
-        for det in res_net.names
-        for i, it in enumerate(res_net[det]["ustat"])
-    ])
-    t0 = min(res_net["H1"]["proc"]["time"][0],
-             res_net["L1"]["proc"]["time"][0])
+    comp_colors = [colors[5], colors[1]]
+    comp_labels = ["Normal", "Abnormal"]
+    comp_order = [normal_idx, 1 - normal_idx]
 
-    fig = plt.figure(figsize=(16, 9))
-    gs = fig.add_gridspec(6, 3, hspace=0.3, wspace=0.3)
-    ax_l1 = fig.add_subplot(gs[0:2, 0:2])
-    ax_l2 = fig.add_subplot(gs[2:4, 0:2], sharex=ax_l1)
-    ax_l3 = fig.add_subplot(gs[4:6, 0:2], sharex=ax_l1)
-    ax_r1 = fig.add_subplot(gs[0:3, 2])
-    ax_r2 = fig.add_subplot(gs[3:6, 2], sharex=ax_r1)
-    left_axes = [ax_l1, ax_l2, ax_l3]
+    for i, ci in enumerate(comp_order):
+        if i == 1:  # Abnormal contour omitted (MCD: only Normal Gaussianity matters)
+            continue
+        rv = multivariate_normal(mcd.means_[ci], mcd.covariances_[ci])
+        pdf_vals = rv.pdf(pos) * mcd.weights_[ci]
+        levels = [pdf_vals.max() * np.exp(-0.5 * n**2) for n in [3, 2, 1]]
+        ax.contour(10**Gh, 10**Gl, pdf_vals,
+                   levels=levels, colors=comp_colors[i], alpha=0.7)
+        #ax.scatter(10**mcd.means_[ci,0], 10**mcd.means_[ci,1],
+        #           color=comp_colors[i], marker="x", s=100,
+        #           label=f"{comp_labels[i]} (w={mcd.weights_[ci]:.2f})")
 
-    plot_anomaly(res_net["H1"]["proc"], tzero=t0, ax=ax_l1,
-                 title=None, xlabel="", ylabel=r"$h_{\rm H1}$")
-    plot_anomaly(res_net["L1"]["proc"], tzero=t0, ax=ax_l2,
-                 title=None, xlabel="", ylabel=r"$h_{\rm L1}$")
-    plot_coinc_clust(coinc_clust, tzero=t0, ax=ax_l3)
-    ax_l3.set_xlabel(f"Time (s) from {t0}")
+    if iso_dsq:
+        for S in iso_dsq:
+            d2h_line = np.linspace(0.01, S-0.01, 500)
+            d2l_line = S - d2h_line
+            ax.plot(d2h_line, d2l_line, color="green", ls="--", lw=1.5, alpha=0.6)
+            ax.text(S, lo, rf"$\Sigma={S}$", fontsize=7, color="green",
+                    rotation=-80, ha="center", va="bottom", clip_on=True)
 
-    det_colors = {"H1": "red", "L1": "blue"}
-    for det in plot_data["Detector"].unique().to_list():
-        subset = plot_data.filter(pl.col("Detector") == det)
-        ax_r1.plot(subset["index"] - len(subset["index"]) + 1, subset["lambda_c"],
-                   marker="o", color=det_colors.get(det), label=det, alpha=0.5)
-        ax_r2.plot(subset["index"] - len(subset["index"]) + 1, subset["lambda_a"],
-                   marker="o", color=det_colors.get(det), label=det, alpha=0.5)
-    ax_r1.set_ylabel(r"$\lambda_c$")
-    ax_r2.set_ylabel(r"$\lambda_a$")
-    ax_r2.set_xlabel("Relative batch index")
-    ax_r2.xaxis.set_major_locator(MaxNLocator(integer=True))
-    ax_r2.legend(loc="best", frameon=True)
+    w_norm = mcd.weights_[normal_idx]
+    w_abn = mcd.weights_[1 - normal_idx]
+    ax.scatter(d2_H[mask_normal], d2_L[mask_normal],
+               alpha=0.25, s=5, color=colors[5],
+               label=f"Normal (w={w_norm:.2f}, n={n_norm:,})")
+    if show_abnormal:
+        ax.scatter(d2_H[~mask_normal], d2_L[~mask_normal],
+                   alpha=0.25, s=5, color=colors[1],
+                   label=f"Abnormal (w={w_abn:.2f}, n={n_abn:,})")
+    else:
+        ax.scatter(d2_H[~mask_normal], d2_L[~mask_normal],
+                   alpha=0.1, s=3, color="gray")
 
-    times = classif_res['times'].to_numpy()
-    labels = classif_res["label"].to_numpy()
-    glc_detail = classif_res["glc_detail"].to_numpy()
-    p_C = classif_res["p_C"].to_numpy()
-    p_dH = classif_res["p_dH"].to_numpy()
-    p_dL = classif_res["p_dL"].to_numpy()
+    ax.set(xscale="log", yscale="log",
+           xlabel=r"$d_{\rm H1}^2$", ylabel=r"$d_{\rm L1}^2$",
+           xlim=(lo, hi), ylim=(lo, hi), aspect="equal")
+    ax.grid(True, which="both", ls="-", alpha=0.2)
+    ax.legend(loc="best", fontsize=9)
+    if standalone:
+        plt.tight_layout(); plt.show()
 
-    label_colors = {"GW": "limegreen", "GLC": "darkorange", "BKG": "gray"}
-    for i in range(len(times)):
-        t_rel = times[i] - t0
-        t_min = t_rel - ar_seg_dur / 2
-        t_max = t_rel + ar_seg_dur / 2
-        col = label_colors[labels[i]]
-        for ax in left_axes:
-            ax.axvspan(t_min, t_max, color=col, alpha=0.25, zorder=0)
 
-    plt.setp(ax_l1.get_xticklabels(), visible=False)
-    plt.setp(ax_l2.get_xticklabels(), visible=False)
-    plt.setp(ax_r1.get_xticklabels(), visible=False)
-    for ax in left_axes + [ax_r1, ax_r2]:
-        for spine in ax.spines.values():
-            spine.set_visible(True)
-        ax.grid(True, linestyle=":", alpha=0.5)
-    plt.tight_layout()
+def plot_null_ref(bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05):
+    mask = bkg_fts["mask_normal"]
+    dH_all = bkg_fts["dH"]; dL_all = bkg_fts["dL"]
+    d2H_all = dH_all ** 2; d2L_all = dL_all ** 2
+    d2H_norm = d2H_all[mask]; d2L_norm = d2L_all[mask]
+    C = (bkg_fts["uH"] * bkg_fts["uL"]).sum(axis=1)
 
-    ymin3, ymax3 = ax_l3.get_ylim()
-    renderer = fig.canvas.get_renderer()
-    inv = ax_l3.transData.inverted()
-    tmp = ax_l3.text(0, 0, "GW\npC=1.0e-01", fontsize=7,
-                     bbox=dict(pad=2, boxstyle="round,pad=0.3"))
-    bb_data = inv.transform(tmp.get_window_extent(renderer).get_points())
-    box_h = bb_data[1, 1] - bb_data[0, 1]
-    tmp.remove()
+    ab = bkg_ref["alpha_beta"]
+    df_H = bkg_ref["df_mle_H"]
+    df_L = bkg_ref["df_mle_L"]
 
-    margin = box_h * 0.3
-    y_text = ymax3 + margin + box_h / 2
-    new_ymax = y_text + box_h / 2 + margin
-    ax_l3.set_ylim(ymin3, new_ymax)
+    n_total = len(dH_all)
+    n_norm = int(mask.sum())
+    n_abn = n_total - n_norm
+    print(f"Null Reference: {n_total} triggers")
+    print(f"  MCD: Normal={n_norm}, Abnormal={n_abn}")
+    print(f"  chi2 MLE: H1 df={df_H:.2f}, L1 df={df_L:.2f}")
+    print(f"  Beta: a=b={ab:.1f}")
 
-    texts = []
-    target_x, target_y = [], []
-    for i in range(len(times)):
-        t_rel = times[i] - t0
-        col = label_colors[labels[i]]
-        if labels[i] == "GW":
-            txt = f"GW\npC={p_C[i]:.1e}"
+    fig = plt.figure(figsize=(10, 4.5))
+    gs_outer = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.0], wspace=0.2)
+    ax_C = fig.add_subplot(gs_outer[0])
+    gs_corner = gs_outer[1].subgridspec(
+        2, 2, wspace=0.04, hspace=0.04,
+        width_ratios=[3, 1], height_ratios=[1, 3],
+    )
+    ax_dH = fig.add_subplot(gs_corner[0, 0])
+    ax_2d = fig.add_subplot(gs_corner[1, 0])
+    ax_dL = fig.add_subplot(gs_corner[1, 1])
+
+    # ── ax_2d: 2D MCD ──
+    plot_d2_plane(d2H_all, d2L_all, bkg_fts["mcd"], mask, ax=ax_2d)
+    ax_2d.set_aspect("auto")
+
+    # ── ax_C: outline hist + Beta PDF ──
+    c_bins = np.linspace(-1, 1, 61)
+    y_grid = np.linspace(-1, 1, 300)
+    ax_C.plot(y_grid, beta_dist.pdf((y_grid + 1) / 2, ab, ab) / 2,
+              "k--", lw=1.5, zorder=4,
+              label=rf"Beta({ab:.1f}, {ab:.1f})")
+    ax_C.hist(C, bins=c_bins, density=True,
+              histtype="step", color=colors[5], linewidth=2.0, zorder=10,
+              label=f"NOS (n={len(C):,})")
+    ax_C.set(xlabel="C", ylabel="density")
+    ax_C.legend(fontsize=8)
+    ax_C.grid(True, alpha=0.3)
+
+    def _draw_marginal(ax, d2, df_mle, ifo_label, orientation):
+        horiz = (orientation == "horizontal")
+        bins = np.logspace(np.log10(max(d2.min(), 1)),
+                           np.log10(d2.max()), 60)
+        x_grid = np.logspace(np.log10(bins[0]), np.log10(bins[-1]), 300)
+        pdf_vals = chi2.pdf(x_grid, df_mle)
+        if horiz:
+            chi2_line, = ax.plot(pdf_vals, x_grid, "k--", lw=1.5, zorder=4,
+                                 label=rf"$\chi^2$(df={df_mle:.1f})")
+            ax.hist(d2, bins=bins, density=True,
+                    histtype="step", orientation="horizontal",
+                    color=colors[5], linewidth=2.0, zorder=10)
+            ax.set(yscale="log", ylabel=rf"$d^2_{{\rm {ifo_label}}}$",
+                   xlabel="density")
+            ax.set_ylim(bins[0], bins[-1])
+            ax.legend([chi2_line], [chi2_line.get_label()],
+                      fontsize=8, loc="upper right")
         else:
-            txt = (f"{labels[i]}{glc_detail[i]}\n"
-                   f"pdH={p_dH[i]:.1e}\npdL={p_dL[i]:.1e}")
-        txt_obj = ax_l3.text(t_rel, y_text, txt,
-                             fontsize=7, ha="center", va="center",
-                             bbox=dict(fc=col, alpha=0.4, pad=2,
-                                       boxstyle="round,pad=0.3"),
-                             zorder=10)
-        texts.append(txt_obj)
-        target_x.append(t_rel)
-        target_y.append(ymax3)
+            chi2_line, = ax.plot(x_grid, pdf_vals, "k--", lw=1.5, zorder=4,
+                                 label=rf"$\chi^2$(df={df_mle:.1f})")
+            ax.hist(d2, bins=bins, density=True,
+                    histtype="step", color=colors[5], linewidth=2.0, zorder=10)
+            ax.set(xscale="log", xlabel=rf"$d^2_{{\rm {ifo_label}}}$",
+                   ylabel="density")
+            ax.set_xlim(bins[0], bins[-1])
+            ax.legend([chi2_line], [chi2_line.get_label()],
+                      fontsize=8, loc="upper right")
+        ax.grid(True, which="both", alpha=0.3)
+    _draw_marginal(ax_dH, d2H_norm, df_H, "H1", "vertical")
+    _draw_marginal(ax_dL, d2L_norm, df_L, "L1", "horizontal")
 
-    fig.canvas.draw()
-    adjust_text(texts, ax=ax_l3,
-                target_x=target_x, target_y=target_y,
-                force_text=(0.5, 1),
-                force_static=(2.0, 1.0),
-                force_pull=(1e-2, 1e-2),
-                force_explode=(0.5, 0.5),
-                max_move=(50, 25),
-                expand=(1.1, 1.0),
-                ensure_inside_axes=True,
-                min_arrow_len=5,
-                iter_lim=5,
-                arrowprops=dict(arrowstyle='->', color='gray', lw=0.5))
+    xlim_2d = ax_2d.get_xlim()
+    ylim_2d = ax_2d.get_ylim()
+    ax_dH.sharex(ax_2d)
+    ax_dL.sharey(ax_2d)
+    ax_dH.set_xlim(xlim_2d)
+    ax_dL.set_ylim(ylim_2d)
+    plt.setp(ax_dH.get_xticklabels(), visible=False)
+    plt.setp(ax_dL.get_yticklabels(), visible=False)
+    ax_dH.set_xlabel("")
+    ax_dL.set_ylabel("")
+
+    fig.suptitle(f"Null Reference (n={n_norm:,})", fontsize=13)
+    fig.text(
+        0.5, -0.05,
+        "Note: NOS = BKG (Normal subset) + GLC (Abnormal subset).",
+        ha="center", va="bottom", fontsize=9, style="italic", color="dimgray",
+    )
+    plt.tight_layout()
     plt.show()
 
 
 def _draw_d2_panel(ax, d2_train, d2_new, labels, df_mle, ifo_label,
                    alpha_d, tau, label_colors, orientation="vertical",
                    show_legend=True):
-    """1D d^2 panel: new BKG+GLC stacked hist + chi^2 PDF + train BKG outline on top.
-
-    orientation:
-        'vertical'   — x=d^2, y=density  (좌상단/우상단용)
-        'horizontal' — x=density, y=d^2  (우하단 marginal용)
-    """
     horiz = (orientation == "horizontal")
     all_d2 = np.concatenate([d2_train, d2_new])
     bins = np.logspace(np.log10(max(all_d2.min(), 1)),
@@ -1671,7 +1479,7 @@ def _draw_d2_panel(ax, d2_train, d2_new, labels, df_mle, ifo_label,
                ylabel="density")
         ax.set_xlim(bins[0], bins[-1])
     if show_legend == "chi2":
-        loc = "lower right" if horiz else "upper right"
+        loc = "upper right"# if horiz else "upper right"
         for line in ax.get_lines():
             lbl = line.get_label()
             if lbl.startswith(r"$\chi^2$"):
@@ -1682,26 +1490,8 @@ def _draw_d2_panel(ax, d2_train, d2_new, labels, df_mle, ifo_label,
     ax.grid(True, which="both", alpha=0.3)
 
 
-def plot_det_bkg(classif_res, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05,
+def plot_classif_summary(classif_res, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05,
                  kde_grid=80, kde_max_n=10000, seed=42):
-    """2x2 classification result plot with BKG reference overlay.
-
-    Layout:
-        [2D KDE: Normal GMM contour + new BKG/GLC KDE contours
-                                   | C 1D + new BKG/GLC/GW density hist]
-        [d^2_H 1D + new BKG/GLC density hist
-                                   | d^2_L 1D + new BKG/GLC density hist]
-
-    Args:
-        classif_res: classification result DataFrame.
-        bkg_fts: dict with 'dH', 'dL', 'uH', 'uL', 'gmm', 'mask_normal'.
-        bkg_ref: dict with 'df_mle_H', 'df_mle_L', 'alpha_beta'.
-        fap_c: FAP for C threshold.
-        alpha_d: significance level for d^2 threshold.
-        kde_grid: 2D KDE grid resolution per axis.
-        kde_max_n: per-class subsample cap for KDE fitting (cost control).
-        seed: RNG seed for subsampling.
-    """
     d2H_new = classif_res['d2H'].to_numpy()
     d2L_new = classif_res['d2L'].to_numpy()
     C_new = classif_res['C'].to_numpy()
@@ -1719,21 +1509,26 @@ def plot_det_bkg(classif_res, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05,
     n_triggers = len(C_new)
     rng = np.random.default_rng(seed)
 
-    fig = plt.figure(figsize=(14, 7))
-    gs_outer = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.0], wspace=0.15)
+    def _filled_layers(rgb, alphas=(0.18, 0.32, 0.50)):
+        return [(*rgb, a) for a in alphas]
+
+    # ── GridSpec: C panel (좌) + corner block (우), 크기 비슷하게 ──
+    fig = plt.figure(figsize=(10, 4.5))
+    gs_outer = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.0], wspace=0.2)
     ax_C = fig.add_subplot(gs_outer[0])
     gs_corner = gs_outer[1].subgridspec(
         2, 2, wspace=0.04, hspace=0.04,
         width_ratios=[3, 1], height_ratios=[1, 3],
     )
-    ax_dH = fig.add_subplot(gs_corner[0, 0])   # d²_H 1D marginal
-    ax_2d = fig.add_subplot(gs_corner[1, 0])   # 2D contour plane
-    ax_dL = fig.add_subplot(gs_corner[1, 1])   # d²_L 1D marginal (rotated)
+    ax_dH = fig.add_subplot(gs_corner[0, 0])
+    ax_2d = fig.add_subplot(gs_corner[1, 0])
+    ax_dL = fig.add_subplot(gs_corner[1, 1])
+    #ax_2d.set_box_aspect(1)
 
-    # ════════ ax_2d (bottom-left): 2D KDE plane (log d^2) ════════
+    # ── ax_2d: 2D combined KDE + label dominance mask ──
     ax = ax_2d
-    gmm = bkg_fts["gmm"]
-    normal_idx = int(np.argmin(gmm.means_.sum(axis=1)))
+    mcd = bkg_fts["mcd"]
+    normal_idx = int(np.argmin(mcd.means_.sum(axis=1)))
 
     all_log_h = np.log10(np.concatenate([bkg_fts["dH"] ** 2, d2H_new]))
     all_log_l = np.log10(np.concatenate([bkg_fts["dL"] ** 2, d2L_new]))
@@ -1743,10 +1538,9 @@ def plot_det_bkg(classif_res, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05,
     Hg, Lg = np.meshgrid(h_lin, l_lin)
     grid_pts = np.vstack([Hg.ravel(), Lg.ravel()])
 
-    # Normal GMM contour (train, outline only 1,2,3σ)
-    rv = multivariate_normal(gmm.means_[normal_idx], gmm.covariances_[normal_idx])
+    rv = multivariate_normal(mcd.means_[normal_idx], mcd.covariances_[normal_idx])
     pos = np.stack([Hg, Lg], axis=-1)
-    pdf_vals = rv.pdf(pos) * gmm.weights_[normal_idx]
+    pdf_vals = rv.pdf(pos) * mcd.weights_[normal_idx]
     normal_levels = sorted(
         pdf_vals.max() * np.exp(-0.5 * n ** 2) for n in (1, 2, 3)
     )
@@ -1755,11 +1549,6 @@ def plot_det_bkg(classif_res, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05,
                alpha=0.9, linewidths=1.4)
     ax.plot([], [], color=colors[5], lw=1.5,
             label=f"BKG train (n={int(mask_bkg_norm.sum()):,})")
-
-    # Single combined KDE (BKG+GLC, GW excluded) — label dominance mask
-    import matplotlib.colors as mcolors
-    def _filled_layers(rgb, alphas=(0.18, 0.32, 0.50)):
-        return [(*rgb, a) for a in alphas]
 
     sigma_p = {1: 0.6827, 2: 0.9545, 3: 0.9973}
     m_bkg = labels == "BKG"
@@ -1774,7 +1563,6 @@ def plot_det_bkg(classif_res, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05,
         return arr_h, arr_l
 
     if n_bkg + n_glc >= 5:
-        # combined KDE for contour shape
         log_h_all = np.log10(np.concatenate([d2H_new[m_bkg], d2H_new[m_glc]]))
         log_l_all = np.log10(np.concatenate([d2L_new[m_bkg], d2L_new[m_glc]]))
         log_h_all, log_l_all = _maybe_subsample(log_h_all, log_l_all,
@@ -1790,7 +1578,6 @@ def plot_det_bkg(classif_res, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05,
         )
         fill_levels = sig_levels + [kde_all_vals.max() * 1.01]
 
-        # label-only KDEs for dominance mask
         if n_bkg >= 5 and n_glc >= 5:
             h_b, l_b = _maybe_subsample(np.log10(d2H_new[m_bkg]),
                                          np.log10(d2L_new[m_bkg]), n_bkg)
@@ -1802,8 +1589,7 @@ def plot_det_bkg(classif_res, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05,
             w_g = kde_g(grid_pts) * n_glc
             bkg_dominant = (w_b >= w_g).reshape(Hg.shape)
         else:
-            bkg_dominant = np.ones_like(kde_all_vals, dtype=bool) \
-                if n_bkg >= n_glc else np.zeros_like(kde_all_vals, dtype=bool)
+            bkg_dominant = np.full_like(kde_all_vals, n_bkg >= n_glc, dtype=bool)
 
         kde_bkg_part = np.where(bkg_dominant, kde_all_vals, np.nan)
         kde_glc_part = np.where(~bkg_dominant, kde_all_vals, np.nan)
@@ -1814,8 +1600,7 @@ def plot_det_bkg(classif_res, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05,
                     levels=fill_levels, colors=_filled_layers(rgb_bkg))
         ax.contourf(10 ** Hg, 10 ** Lg, kde_glc_part,
                     levels=fill_levels,
-                    colors=_filled_layers(rgb_glc,
-                                          alphas=(0.08, 0.16, 0.25)))
+                    colors=_filled_layers(rgb_glc))#, alphas=(0.08, 0.16, 0.25)))
         ax.contour(10 ** Hg, 10 ** Lg, kde_bkg_part,
                    levels=sig_levels, colors=label_colors["BKG"],
                    alpha=0.9, linewidths=1.0)
@@ -1828,23 +1613,20 @@ def plot_det_bkg(classif_res, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05,
                 label=f"new GLC (n={n_glc:,})")
 
     ax.axvline(tau_H, color=colors[6], ls=":", lw=1.5, alpha=0.85,
-               label=rf"$\tau_H$={tau_H:.1f}")
+               label=rf"$\tau_{{\rm H1}}$={tau_H:.1f}")
     ax.axhline(tau_L, color=colors[6], ls=":", lw=1.5, alpha=0.85,
-               label=rf"$\tau_L$={tau_L:.1f}")
-
+               label=rf"$\tau_{{\rm L1}}$={tau_L:.1f}")
     ax.set(xscale="log", yscale="log",
            xlabel=r"$d_{\rm H1}^2$", ylabel=r"$d_{\rm L1}^2$",
            xlim=(10 ** h_lin[0], 10 ** h_lin[-1]),
            ylim=(10 ** l_lin[0], 10 ** l_lin[-1]))
     ax.grid(True, which="both", ls="-", alpha=0.2)
-    ax.legend(loc="upper left", fontsize=8)
+    ax.legend(loc="best", fontsize=8)
 
-    # ════════ ax_C (top-right): C — stacked new hist, train BKG outline on top ════════
+    # ── ax_C: C 1D ──
     ax = ax_C
     tau_C = 2 * beta_dist.ppf(1 - fap_c, ab, ab) - 1
     c_bins = np.linspace(-1, 1, 61)
-
-    # stacked: 전체 new를 한 번에 정규화 → 라벨별 색만 분리
     stack_data, stack_colors, stack_labels = [], [], []
     for lab in ["BKG", "GLC", "GW"]:
         m = labels == lab
@@ -1860,14 +1642,12 @@ def plot_det_bkg(classif_res, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05,
                 histtype="stepfilled",
                 color=fill_cols, edgecolor=stack_colors, linewidth=1.5,
                 label=stack_labels, zorder=2)
-
     y_grid = np.linspace(-1, 1, 300)
     ax.plot(y_grid, beta_dist.pdf((y_grid + 1) / 2, ab, ab) / 2,
             "k--", lw=1.5, zorder=4,
             label=rf"Beta({ab:.1f}, {ab:.1f})")
-    ax.axvline(tau_C, color=colors[6], ls=":", lw=1.5, zorder=4,
+    ax.axvline(tau_C, color=colors[3], ls="-.", lw=1.5, zorder=4,
                label=rf"FAP={fap_c:.3f} ($\tau_C$={tau_C:.3f})")
-
     ax.hist(C_bkg, bins=c_bins, density=True,
             histtype="step", color=colors[5], linewidth=2.0, zorder=10,
             label=f"BKG train (n={len(C_bkg):,})")
@@ -1875,19 +1655,17 @@ def plot_det_bkg(classif_res, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05,
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # ════════ ax_dH (top-left): d²_H 1D marginal (chi² legend only) ════════
+    # ── marginals (no legend, share axis with 2D) ──
     _draw_d2_panel(ax_dH, d2H_bkg, d2H_new, labels,
                    bkg_ref["df_mle_H"], "H1", alpha_d,
                    tau_H, label_colors, orientation="vertical",
                    show_legend="chi2")
 
-    # ════════ ax_dL (bottom-right): d²_L 1D marginal rotated (chi² legend only) ════════
     _draw_d2_panel(ax_dL, d2L_bkg, d2L_new, labels,
                    bkg_ref["df_mle_L"], "L1", alpha_d,
                    tau_L, label_colors, orientation="horizontal",
                    show_legend="chi2")
 
-    # Axis sharing & label cleanup
     xlim_2d = ax_2d.get_xlim()
     ylim_2d = ax_2d.get_ylim()
     ax_dH.sharex(ax_2d)
@@ -1900,20 +1678,20 @@ def plot_det_bkg(classif_res, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05,
     ax_dL.set_ylabel("")
 
     fig.suptitle(f"Classification (n={n_triggers} triggers)", fontsize=13)
+    fig.text(
+        0.5, -0.05,
+        "Note: BKG and GLC are drawn as stacked histograms — "
+        "bar heights are cumulative, not independent.",
+        ha="center", va="bottom", fontsize=9, style="italic", color="dimgray",
+    )
+    plt.tight_layout()
     plt.show()
 
 
-def plot_det_bkg_3d(classif_res, label_colors,
+def plot_classif_summary_3d(classif_res, label_colors,
                     grid_size=50, kde_max_n=8000, seed=42,
                     sigma_levels=(1, 2),
                     sigma_alphas=(0.55, 0.25)):
-    """Interactive 3D KDE isosurface in (log10 d²_H, log10 d²_L, C) space.
-
-    Combined distribution surface (per-label max-normalized union) is
-    extracted with marching cubes, then each face is colored by the
-    weighted-KDE-dominant label at its center — i.e. one continuous
-    surface whose color changes by region.
-    """
     import plotly.graph_objects as go
     from skimage import measure
     sigma_p = {1: 0.6827, 2: 0.9545, 3: 0.9973}
@@ -1931,7 +1709,6 @@ def plot_det_bkg_3d(classif_res, label_colors,
     Hg, Lg, Cg = np.meshgrid(h_lin, l_lin, c_lin, indexing="ij")
     pts = np.vstack([Hg.ravel(), Lg.ravel(), Cg.ravel()])
 
-    # per-label KDEs (kept as callables for face-center evaluation)
     kdes, label_counts = {}, {}
     for lab in ["BKG", "GLC", "GW"]:
         m = labels == lab
@@ -1948,10 +1725,7 @@ def plot_det_bkg_3d(classif_res, label_colors,
     if not label_list:
         print("No labels with sufficient data."); return
 
-    # per-label density on grid
     raw_grid = {lab: kdes[lab](pts) for lab in label_list}
-
-    # union surface: max over per-label max-normalized densities
     union = np.zeros_like(raw_grid[label_list[0]])
     for lab in label_list:
         norm = raw_grid[lab] / raw_grid[lab].max()
@@ -1982,12 +1756,11 @@ def plot_det_bkg_3d(classif_res, label_colors,
             continue
         verts = verts + origin
 
-        # face centers → weighted KDE → dominant label
-        face_centers = verts[faces].mean(axis=1)            # (n_faces, 3)
+        face_centers = verts[faces].mean(axis=1)
         face_dens = np.stack([
             kdes[lab](face_centers.T) * label_counts[lab]
             for lab in label_list
-        ], axis=0)                                          # (n_labels, n_faces)
+        ], axis=0)
         face_lab = np.argmax(face_dens, axis=0)
 
         for i, lab in enumerate(label_list):
@@ -2032,3 +1805,296 @@ def plot_det_bkg_3d(classif_res, label_colors,
         margin=dict(l=0, r=0, t=40, b=0),
     )
     fig.show()
+
+
+def place_trigger_labels(ax, fig, items, base_x, base_y, row_gap_frac=0.35,
+                         x_margin_frac=0.02, data_gap_frac=0.03, top_limit=0.90,
+                         expand=1.5, n_iter=10):
+    """Label boxes: bounded rows (interval scheduling) at local-curve heights.
+
+    Row index = interval scheduling on x (depth = max simultaneous overlap, so a
+    long chain of pairwise overlaps still fits in a few rows — no runaway stack).
+    Vertical position = local coinc-curve height under the box + row offset, in
+    axes-fraction (stable on any y-scale). ymax grows only if the tallest box
+    would exceed top_limit. Use with a symlog S axis.
+
+    items: list of dict(x=trigger_x_rel, txt=str, color=facecolor).
+    base_x, base_y: coinc net-S curve (x rel to t0, S data units).
+    """
+    rend = fig.canvas.get_renderer()
+    inv = ax.transData.inverted()
+    x0, x1 = ax.get_xlim()
+    xr = x1 - x0
+    xat = ax.get_xaxis_transform()
+
+    def fracY(ys, xc):                            # data-y -> axes-fraction y
+        ab = ax.get_window_extent(rend)
+        py = ax.transData.transform(
+            np.column_stack([np.full(np.shape(ys), xc), ys]))[:, 1]
+        return (py - ab.y0) / ab.height
+
+    box_hf, hw = 0.0, []
+    for it in items:
+        t = ax.text(it["x"], 0.5, it["txt"], transform=xat, fontsize=7,
+                    ha="center", va="center",
+                    bbox=dict(pad=2, boxstyle="round,pad=0.3"))
+        fig.canvas.draw()
+        ext = t.get_window_extent(rend)
+        (xa, _), (xb, _) = inv.transform([[ext.x0, ext.y0], [ext.x1, ext.y1]])
+        hw.append((xb - xa) / 2)
+        box_hf = max(box_hf, ext.height / ax.get_window_extent(rend).height)
+        t.remove()
+
+    base_x = np.asarray(base_x, float)
+    base_y = np.asarray(base_y, float)
+    mx = x_margin_frac * xr
+    cx = [min(max(items[i]["x"], x0 + mx + hw[i]), x1 - mx - hw[i])
+          for i in range(len(items))]
+    L = [cx[i] - hw[i] for i in range(len(items))]
+    R = [cx[i] + hw[i] for i in range(len(items))]
+
+    # bounded rows: interval scheduling (lowest free row)
+    rows_right, row_of = [], [0] * len(items)
+    for i in sorted(range(len(items)), key=lambda k: L[k]):
+        for r in range(len(rows_right)):
+            if rows_right[r] + 0.012 * xr <= L[i]:
+                row_of[i] = r
+                rows_right[r] = R[i]
+                break
+        else:
+            row_of[i] = len(rows_right)
+            rows_right.append(R[i])
+    row_hf = box_hf * (1 + row_gap_frac)
+
+    # local curve height (data) under each box
+    cbase = []
+    for i in range(len(items)):
+        m = (base_x >= L[i]) & (base_x <= R[i])
+        cbase.append(float(np.nanmax(base_y[m])) if m.any() else ax.get_ylim()[0])
+
+    def layout():
+        bottoms = [float(fracY([cbase[i]], cx[i])[0]) + data_gap_frac
+                   + row_of[i] * row_hf for i in range(len(items))]
+        return bottoms, max(b + box_hf for b in bottoms)
+
+    for _ in range(n_iter):                       # grow ymax only if tallest overflows
+        bottoms, mtop = layout()
+        if mtop <= top_limit:
+            break
+        lo, hi = ax.get_ylim()
+        ax.set_ylim(lo, hi * expand)
+    bottoms, mtop = layout()
+
+    for i, it in enumerate(items):
+        ax.annotate(
+            it["txt"], xy=(it["x"], cbase[i]), xycoords=ax.transData,
+            xytext=(cx[i], bottoms[i] + box_hf / 2), textcoords=xat,
+            ha="center", va="center", fontsize=8,
+            bbox=dict(fc=it["color"], alpha=0.4, pad=2, boxstyle="round,pad=0.3"),
+            arrowprops=dict(arrowstyle="->", color="gray", lw=0.5,
+                            shrinkA=0, shrinkB=0),
+            zorder=10,
+        )
+
+
+def plot_batch_dashboard(
+    seg_dir, batch_id, figsize=(12, 9), ar_seg_dur=32 * 15 / 4096, save_path=None
+):
+    """배치별 진단 대시보드 + 분류 오버레이 (좌측 3패널: H1 / L1 / coinc).
+
+    저장된 parquet(proc/coinc/classif)로부터 자동 로드.
+    분류 음영: 고정폭 ar_seg_dur (= 특징추출 윈도우), 색 = 라벨.
+    coinc 마커: 색 = 분류 라벨, 모양 = 클러스터 구분.
+
+    Args:
+        seg_dir: beacon_results 디렉토리 (Path 또는 str).
+        batch_id: 배치 번호.
+        figsize: figure 크기 (가로, 세로).
+        ar_seg_dur: 분류 shading 폭 (초).
+    """
+    seg_dir = Path(seg_dir)
+    label_colors = {"GW": "limegreen", "GLC": "darkorange", "BKG": "gray"}
+    cluster_markers = ["o", "s", "^", "D", "*", "p", "v", "<", ">", "h"]
+
+    # ── 데이터 로드 ───────────────────────────────────────────────
+    proc_h1 = pl.read_parquet(
+        str(seg_dir / "proc" / f"batch_{batch_id:04d}_H1.parquet")
+    )
+    proc_l1 = pl.read_parquet(
+        str(seg_dir / "proc" / f"batch_{batch_id:04d}_L1.parquet")
+    )
+    coinc = pl.read_parquet(str(seg_dir / "coinc" / f"batch_{batch_id:04d}.parquet"))
+
+    classif_path = seg_dir / "classif" / f"batch_{batch_id:04d}.parquet"
+    classif = pl.read_parquet(str(classif_path)) if classif_path.exists() else None
+
+    # ── t0 기준 ──────────────────────────────────────────────────
+    t0 = min(proc_h1["time"][0], proc_l1["time"][0])
+
+    # ── Figure 구성 (좌측 3패널) ─────────────────────────────────
+    fig = plt.figure(figsize=figsize)
+    gs = fig.add_gridspec(3, 1, hspace=0.05)
+    ax_l1 = fig.add_subplot(gs[0])
+    ax_l2 = fig.add_subplot(gs[1], sharex=ax_l1)
+    ax_l3 = fig.add_subplot(gs[2], sharex=ax_l1)
+    left_axes = [ax_l1, ax_l2, ax_l3]
+
+    # anomaly (strain)
+    plot_anomaly(
+        proc_h1, tzero=t0, ax=ax_l1, title=None, xlabel="", ylabel=r"$h_{\rm H1}$"
+    )
+    plot_anomaly(
+        proc_l1, tzero=t0, ax=ax_l2, title=None, xlabel="", ylabel=r"$h_{\rm L1}$"
+    )
+
+    # coinc: S-곡선 (net/H1/L1) + 라벨색 마커 (모양=클러스터)
+    plot_coinc(coinc, tzero=t0, ax=ax_l3)
+    ax_l3.set_yscale("symlog", linthresh=3)   # S: 0~3 linear, 그 위 log (스파이크 가시화)
+    ax_l3.set_ylim(bottom=0)
+    ax_l3.set_xlabel(f"Time (s) from {t0}")
+
+    # coinc 마커: 색 = 2차 DBSCAN 클러스터(tab10), 모양 = 클러스터 구분
+    cmap_clusters = plt.get_cmap("tab10")
+    unique_clusters = (
+        coinc.filter(pl.col("coincl_id").is_not_null())["coincl_id"].unique().sort()
+    )
+    for i, c_id in enumerate(unique_clusters):
+        subset = coinc.filter(pl.col("coincl_id") == c_id)
+        ax_l3.scatter(
+            (subset["time_bin"] - t0).to_numpy(),
+            subset["S"].to_numpy(),
+            color=cmap_clusters(i % 10),
+            marker=cluster_markers[i % len(cluster_markers)],
+            s=40,
+            zorder=5,
+        )
+
+    # ── 분류 오버레이 (고정폭 박스 = 특징추출 윈도우) ────────────
+    if classif is not None and len(classif) > 0:
+        times = classif["times"].to_numpy()
+        labels = classif["label"].to_numpy()
+        glc_detail = classif["glc_detail"].to_numpy()
+        p_C = classif["p_C"].to_numpy()
+        p_dH = classif["p_dH"].to_numpy()
+        p_dL = classif["p_dL"].to_numpy()
+
+        # shading
+        for i in range(len(times)):
+            t_rel = times[i] - t0
+            t_min = t_rel - ar_seg_dur / 2
+            t_max = t_rel + ar_seg_dur / 2
+            col = label_colors[labels[i]]
+            for ax in left_axes:
+                ax.axvspan(t_min, t_max, color=col, alpha=0.25, zorder=0)
+
+        # 라벨 박스: 결정론적 lane 배치 (겹침 없음 + 트리거로 화살표)
+        items = []
+        for i in range(len(times)):
+            if labels[i] == "GW":
+                txt = f"GW\npC={p_C[i]:.1e}"
+            else:
+                txt = (f"{labels[i]}{glc_detail[i]}\n"
+                       f"pdH={p_dH[i]:.1e}\npdL={p_dL[i]:.1e}")
+            items.append(dict(x=times[i] - t0, txt=txt,
+                              color=label_colors[labels[i]]))
+
+        base_x = (coinc["time_bin"] - t0).to_numpy()
+        base_y = coinc["S"].to_numpy()
+        finite = np.isfinite(base_y)
+        base_y = np.where(finite, base_y, base_y[finite].max() if finite.any() else 0.0)
+        place_trigger_labels(ax_l3, fig, items, base_x, base_y, data_gap_frac=0.1)
+
+    # ── 공통 스타일 ──────────────────────────────────────────────
+    leg = ax_l3.get_legend()
+    if leg is not None:
+        ax_l3.legend(loc="center right", bbox_to_anchor=(1.0, -0.25),
+                     ncol=3, fontsize=10, framealpha=0.8)
+    
+    plt.setp(ax_l1.get_xticklabels(), visible=False)
+    plt.setp(ax_l2.get_xticklabels(), visible=False)
+    
+    for ax in left_axes:
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+        ax.grid(True, linestyle=":", alpha=0.5)
+        
+        ax.yaxis.label.set_size(12)
+        ax.title.set_size(14)    
+    ax_l3.xaxis.label.set_size(12)
+        
+    plt.tight_layout()
+    
+    if save_path is not None:
+        fig.savefig(save_path, bbox_inches="tight")
+    plt.show()
+
+
+def plot_refit_status(seg_dir, batch_id, window=128):
+    """AR model refit status timeline: full / gated / skip per H1/L1.
+
+    Args:
+        seg_dir: beacon_results directory (Path or str).
+        batch_id: current batch number (window end).
+        window: number of batches to display (default 128 = 512s).
+    """
+    seg_dir = Path(seg_dir)
+    summary = pl.read_parquet(str(seg_dir / "summary.parquet"))
+    batch_lo = max(1, batch_id - window + 1)
+    sw = summary.filter(
+        (pl.col("batch_id") >= batch_lo) & (pl.col("batch_id") <= batch_id)
+    )
+
+    status_colors = {"full": "seagreen", "gated": "orange", "skip": "whitesmoke"}
+    status_edge = {"full": "seagreen", "gated": "orange", "skip": "lightgray"}
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 3), sharex=True)
+
+    for ax, det in zip(axes, ["H1", "L1"]):
+        det_rows = (sw.filter(pl.col("detector") == det)
+                      .sort("batch_id"))
+        batch_ids = det_rows["batch_id"].to_numpy()
+        statuses = det_rows["fit_status"].to_numpy()
+        rel_idx = batch_ids - batch_id
+
+        for st in ["full", "gated", "skip"]:
+            m = statuses == st
+            spans = [(x - 0.5, 1) for x in rel_idx[m]]
+            if spans:
+                alpha = 0.3 if st == "skip" else 0.7
+                ax.broken_barh(spans, (0, 1),
+                               facecolors=status_colors[st], alpha=alpha,
+                               edgecolors=status_edge[st], linewidth=0.3)
+
+        n_total = len(statuses)
+        n_full = int((statuses == "full").sum())
+        n_gated = int((statuses == "gated").sum())
+        n_skip = int((statuses == "skip").sum())
+        n_refit = n_full + n_gated
+        frac = n_refit / n_total if n_total > 0 else 0
+        ax.set_ylabel(det, fontsize=11, fontweight="bold")
+        ax.set_ylim(0, 1)
+        ax.set_yticks([])
+        ax.text(1.01, 0.5,
+                f"refit {n_refit}/{n_total} ({frac:.0%})\n"
+                f"full {n_full} | gated {n_gated} | skip {n_skip}",
+                transform=ax.transAxes, va="center", fontsize=8)
+
+        for spine in ["top", "right", "left"]:
+            ax.spines[spine].set_visible(False)
+        ax.spines["bottom"].set_visible(True)
+
+    # legend
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor="seagreen", alpha=0.7, label="full"),
+        Patch(facecolor="orange", alpha=0.7, label="gated"),
+        Patch(facecolor="whitesmoke", edgecolor="lightgray", label="skip"),
+    ]
+    axes[0].legend(handles=legend_elements, loc="upper left",
+                   ncol=3, fontsize=8, frameon=True)
+
+    axes[1].set_xlabel("Relative batch index")
+    fig.suptitle(f"AR Model Refit Status — batch {batch_lo}–{batch_id}",
+                 fontsize=12)
+    plt.tight_layout()
+    plt.show()

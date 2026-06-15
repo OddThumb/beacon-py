@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "beacon-py"
-version = "0.1.0"
+version = "0.5.0"
 description = "BEACON: Burst Event Anomaly Clustering and Outlier Notification - A fully data-driven pipeline for detecting unmodeled gravitational wave transients"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,10 +19,10 @@ keywords = [
     "gravitational waves",
     "time series",
     "frequency series",
-    "Q-transform",
     "signal processing",
     "anomaly detection",
     "burst detection",
+    "Autoregressive",
     "seqARIMA",
     "DBSCAN",
     "GW transients",

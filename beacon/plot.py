@@ -1,7 +1,12 @@
 from __future__ import annotations
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.patheffects as pe
 from matplotlib.ticker import FuncFormatter, MaxNLocator
+from matplotlib.offsetbox import AnchoredOffsetbox, AuxTransformBox
+from matplotlib.transforms import Affine2D
+from matplotlib.lines import Line2D
+from matplotlib.text import Text
 
 # from .QT import qtransform
 from matplotlib.colors import Normalize
@@ -1290,17 +1295,24 @@ def plot_d2_plane(d2_H, d2_L, mcd, mask_normal, iso_dsq=None, ax=None,
     comp_labels = ["Normal", "Abnormal"]
     comp_order = [normal_idx, 1 - normal_idx]
 
+    # Normal scatter and contour share colors[5] (blue); a white halo around the
+    # contour lines keeps the Gaussian core distinct from the dense scatter.
+    contour_color = colors[5]
     for i, ci in enumerate(comp_order):
         if i == 1:  # Abnormal contour omitted (MCD: only Normal Gaussianity matters)
             continue
         rv = multivariate_normal(mcd.means_[ci], mcd.covariances_[ci])
         pdf_vals = rv.pdf(pos) * mcd.weights_[ci]
         levels = [pdf_vals.max() * np.exp(-0.5 * n**2) for n in [3, 2, 1]]
-        ax.contour(10**Gh, 10**Gl, pdf_vals,
-                   levels=levels, colors=comp_colors[i], alpha=0.7)
-        #ax.scatter(10**mcd.means_[ci,0], 10**mcd.means_[ci,1],
-        #           color=comp_colors[i], marker="x", s=100,
-        #           label=f"{comp_labels[i]} (w={mcd.weights_[ci]:.2f})")
+        cs = ax.contour(10**Gh, 10**Gl, pdf_vals,
+                        levels=levels, colors=contour_color, linewidths=1.5,
+                        alpha=0.95, zorder=20)
+        halo = [pe.withStroke(linewidth=2.0, foreground="white")]
+        try:
+            cs.set_path_effects(halo)            # matplotlib >= 3.8 (ContourSet is a Collection)
+        except AttributeError:
+            for col in cs.collections:           # older matplotlib
+                col.set_path_effects(halo)
 
     if iso_dsq:
         for S in iso_dsq:
@@ -1332,7 +1344,7 @@ def plot_d2_plane(d2_H, d2_L, mcd, mask_normal, iso_dsq=None, ax=None,
         plt.tight_layout(); plt.show()
 
 
-def plot_null_ref(bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05):
+def plot_null_ref(bkg_fts, bkg_ref, figsize=(10, 4.5), save_path=None):
     mask = bkg_fts["mask_normal"]
     dH_all = bkg_fts["dH"]; dL_all = bkg_fts["dL"]
     d2H_all = dH_all ** 2; d2L_all = dL_all ** 2
@@ -1351,7 +1363,7 @@ def plot_null_ref(bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05):
     print(f"  chi2 MLE: H1 df={df_H:.2f}, L1 df={df_L:.2f}")
     print(f"  Beta: a=b={ab:.1f}")
 
-    fig = plt.figure(figsize=(10, 4.5))
+    fig = plt.figure(figsize=figsize)
     gs_outer = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.0], wspace=0.2)
     ax_C = fig.add_subplot(gs_outer[0])
     gs_corner = gs_outer[1].subgridspec(
@@ -1370,10 +1382,10 @@ def plot_null_ref(bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05):
     c_bins = np.linspace(-1, 1, 61)
     y_grid = np.linspace(-1, 1, 300)
     ax_C.plot(y_grid, beta_dist.pdf((y_grid + 1) / 2, ab, ab) / 2,
-              "k--", lw=1.5, zorder=4,
+              "k--", lw=1.5, zorder=10,
               label=rf"Beta({ab:.1f}, {ab:.1f})")
     ax_C.hist(C, bins=c_bins, density=True,
-              histtype="step", color=colors[5], linewidth=2.0, zorder=10,
+              histtype="step", color=colors[5], linewidth=2.0, zorder=4,
               label=f"NOS (n={len(C):,})")
     ax_C.set(xlabel="C", ylabel="density")
     ax_C.legend(fontsize=8)
@@ -1386,21 +1398,36 @@ def plot_null_ref(bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05):
         x_grid = np.logspace(np.log10(bins[0]), np.log10(bins[-1]), 300)
         pdf_vals = chi2.pdf(x_grid, df_mle)
         if horiz:
-            chi2_line, = ax.plot(pdf_vals, x_grid, "k--", lw=1.5, zorder=4,
+            chi2_line, = ax.plot(pdf_vals, x_grid, "k--", lw=1.5, zorder=10,
                                  label=rf"$\chi^2$(df={df_mle:.1f})")
             ax.hist(d2, bins=bins, density=True,
                     histtype="step", orientation="horizontal",
-                    color=colors[5], linewidth=2.0, zorder=10)
+                    color=colors[5], linewidth=1.5, zorder=4)
             ax.set(yscale="log", ylabel=rf"$d^2_{{\rm {ifo_label}}}$",
                    xlabel="density")
             ax.set_ylim(bins[0], bins[-1])
-            ax.legend([chi2_line], [chi2_line.get_label()],
-                      fontsize=8, loc="upper right")
+
+            # Real rotated legend: build it already vertical.
+            # (AuxTransformBox rotates the line path but NOT the glyphs, so the
+            #  text must carry rotation itself; line is drawn vertical.)
+            tbox = AuxTransformBox(Affine2D())
+            tbox.add_artist(Line2D([0, 0], [8, 24], color="k", ls="--", lw=1.5))
+            tbox.add_artist(Text(0, -4, chi2_line.get_label(),
+                                 rotation=270, rotation_mode="anchor",
+                                 ha="left", va="center", fontsize=8))
+            anchored = AnchoredOffsetbox(
+                loc="upper right", child=tbox, frameon=True,
+                borderpad=0.3, bbox_to_anchor=(1.0, 1.0),
+                bbox_transform=ax.transAxes,
+            )
+            anchored.patch.set(facecolor="white", edgecolor="0.7", alpha=0.7)
+            anchored.set_zorder(11)
+            ax.add_artist(anchored)
         else:
-            chi2_line, = ax.plot(x_grid, pdf_vals, "k--", lw=1.5, zorder=4,
+            chi2_line, = ax.plot(x_grid, pdf_vals, "k--", lw=1.5, zorder=10,
                                  label=rf"$\chi^2$(df={df_mle:.1f})")
             ax.hist(d2, bins=bins, density=True,
-                    histtype="step", color=colors[5], linewidth=2.0, zorder=10)
+                    histtype="step", color=colors[5], linewidth=1.5, zorder=4)
             ax.set(xscale="log", xlabel=rf"$d^2_{{\rm {ifo_label}}}$",
                    ylabel="density")
             ax.set_xlim(bins[0], bins[-1])
@@ -1422,12 +1449,9 @@ def plot_null_ref(bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05):
     ax_dL.set_ylabel("")
 
     fig.suptitle(f"Null Reference (n={n_norm:,})", fontsize=13)
-    fig.text(
-        0.5, -0.05,
-        "Note: NOS = BKG (Normal subset) + GLC (Abnormal subset).",
-        ha="center", va="bottom", fontsize=9, style="italic", color="dimgray",
-    )
     plt.tight_layout()
+    if save_path is not None:
+        fig.savefig(save_path, bbox_inches="tight", dpi=300)
     plt.show()
 
 

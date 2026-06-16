@@ -1821,6 +1821,21 @@ def place_trigger_labels(ax, fig, items, base_x, base_y, row_gap_frac=0.35,
     items: list of dict(x=trigger_x_rel, txt=str, color=facecolor).
     base_x, base_y: coinc net-S curve (x rel to t0, S data units).
     """
+    from matplotlib.patches import BoxStyle
+
+    class _RoundTop(BoxStyle.Round):           # 상단 패딩만 추가 (top-only pad)
+        # mathtext 라인이 섞이면 블록 윗줄 ascent 예약폭이 ~0.2*fontsize 깎여
+        # 텍스트가 박스 안에서 위로 쏠린다. 상단에만 그만큼 패딩을 더해 잉크를 중앙정렬.
+        def __init__(self, pad=0.3, rounding_size=None, top_pad=0.0):
+            super().__init__(pad=pad, rounding_size=rounding_size)
+            self.top_pad = top_pad
+
+        def __call__(self, x0, y0, width, height, mutation_size):
+            return super().__call__(
+                x0, y0, width, height + self.top_pad * mutation_size, mutation_size)
+
+    box = _RoundTop(pad=0.3, top_pad=0.5)      # 실측 튜닝값 (mathtext 라벨 중앙정렬)
+
     rend = fig.canvas.get_renderer()
     inv = ax.transData.inverted()
     x0, x1 = ax.get_xlim()
@@ -1837,7 +1852,7 @@ def place_trigger_labels(ax, fig, items, base_x, base_y, row_gap_frac=0.35,
     for it in items:
         t = ax.text(it["x"], 0.5, it["txt"], transform=xat, fontsize=7,
                     ha="center", va="center",
-                    bbox=dict(pad=2, boxstyle="round,pad=0.3"))
+                    bbox=dict(pad=2, boxstyle=box))
         fig.canvas.draw()
         ext = t.get_window_extent(rend)
         (xa, _), (xb, _) = inv.transform([[ext.x0, ext.y0], [ext.x1, ext.y1]])
@@ -1890,7 +1905,7 @@ def place_trigger_labels(ax, fig, items, base_x, base_y, row_gap_frac=0.35,
             it["txt"], xy=(it["x"], cbase[i]), xycoords=ax.transData,
             xytext=(cx[i], bottoms[i] + box_hf / 2), textcoords=xat,
             ha="center", va="center", fontsize=8,
-            bbox=dict(fc=it["color"], alpha=0.4, pad=2, boxstyle="round,pad=0.3"),
+            bbox=dict(fc=it["color"], alpha=0.4, pad=2, boxstyle=box),
             arrowprops=dict(arrowstyle="->", color="gray", lw=0.5,
                             shrinkA=0, shrinkB=0),
             zorder=10,

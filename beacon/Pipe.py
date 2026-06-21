@@ -696,7 +696,7 @@ def config_pipe(replace: Optional[Rist] = None, show_config: bool = True) -> Ris
         # _____Autoregressive Veto_____
         feat_dim=32,
         bkg_ref=None,
-        fap_c=0.053,
+        fap_c=0.05,
         alpha_d=0.05,
     )
     

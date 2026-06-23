@@ -1503,18 +1503,30 @@ def _draw_d2_panel(ax, d2_train, d2_new, labels, df_mle, ifo_label,
                ylabel="density")
         ax.set_xlim(bins[0], bins[-1])
     if show_legend == "chi2":
-        loc = "upper right"# if horiz else "upper right"
-        for line in ax.get_lines():
-            lbl = line.get_label()
-            if lbl.startswith(r"$\chi^2$"):
-                ax.legend([line], [lbl], fontsize=8, loc=loc)
-                break
+        chi2_line = next((l for l in ax.get_lines()
+                          if l.get_label().startswith(r"$\chi^2$")), None)
+        if chi2_line is not None and horiz:
+            # rotated legend for the narrow right margin (see plot_null_ref)
+            tbox = AuxTransformBox(Affine2D())
+            tbox.add_artist(Line2D([0, 0], [8, 24], color="k", ls="--", lw=1.5))
+            tbox.add_artist(Text(0, -4, chi2_line.get_label(),
+                                 rotation=270, rotation_mode="anchor",
+                                 ha="left", va="center", fontsize=8))
+            anchored = AnchoredOffsetbox(
+                loc="upper right", child=tbox, frameon=True, borderpad=0.3,
+                bbox_to_anchor=(1.0, 1.0), bbox_transform=ax.transAxes)
+            anchored.patch.set(facecolor="white", edgecolor="0.7", alpha=0.7)
+            anchored.set_zorder(11)
+            ax.add_artist(anchored)
+        elif chi2_line is not None:
+            ax.legend([chi2_line], [chi2_line.get_label()],
+                      fontsize=8, loc="upper right")
     elif show_legend:
         ax.legend(fontsize=8)
     ax.grid(True, which="both", alpha=0.3)
 
 
-def plot_classif_summary(classif_res, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.05,
+def plot_classif_summary(classif_res, bkg_fts, bkg_ref, fap_c=0.005, alpha_d=0.05,
                  kde_grid=80, kde_max_n=10000, seed=42):
     d2H_new = classif_res['d2H'].to_numpy()
     d2L_new = classif_res['d2L'].to_numpy()
@@ -1671,12 +1683,12 @@ def plot_classif_summary(classif_res, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.0
             "k--", lw=1.5, zorder=4,
             label=rf"Beta({ab:.1f}, {ab:.1f})")
     ax.axvline(tau_C, color=colors[3], ls="-.", lw=1.5, zorder=4,
-               label=rf"FAP={fap_c:.3f} ($\tau_C$={tau_C:.3f})")
+               label=rf"FAP$_C$={fap_c:.3f} ($\tau_C$={tau_C:.3f})")
     ax.hist(C_bkg, bins=c_bins, density=True,
             histtype="step", color=colors[5], linewidth=2.0, zorder=10,
             label=f"BKG train (n={len(C_bkg):,})")
     ax.set(xlabel="C", ylabel="density")
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=8, loc="upper left")
     ax.grid(True, alpha=0.3)
 
     # ── marginals (no legend, share axis with 2D) ──
@@ -1702,12 +1714,6 @@ def plot_classif_summary(classif_res, bkg_fts, bkg_ref, fap_c=0.053, alpha_d=0.0
     ax_dL.set_ylabel("")
 
     fig.suptitle(f"Classification (n={n_triggers} triggers)", fontsize=13)
-    fig.text(
-        0.5, -0.05,
-        "Note: BKG and GLC are drawn as stacked histograms — "
-        "bar heights are cumulative, not independent.",
-        ha="center", va="bottom", fontsize=9, style="italic", color="dimgray",
-    )
     plt.tight_layout()
     plt.show()
 

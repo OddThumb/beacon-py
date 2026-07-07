@@ -1322,15 +1322,27 @@ def plot_d2_plane(d2_H, d2_L, mcd, mask_normal, iso_dsq=None, ax=None,
             ax.text(S, lo, rf"$\Sigma={S}$", fontsize=7, color="green",
                     rotation=-80, ha="center", va="bottom", clip_on=True)
 
-    w_norm = mcd.weights_[normal_idx]
-    w_abn = mcd.weights_[1 - normal_idx]
-    ax.scatter(d2_H[mask_normal], d2_L[mask_normal],
-               alpha=0.25, s=5, color=colors[5],
-               label=f"Normal (w={w_norm:.2f}, n={n_norm:,})")
+    #w_norm = mcd.weights_[normal_idx]
+    #w_abn = mcd.weights_[1 - normal_idx]
+    ax.scatter(
+        d2_H[mask_normal],
+        d2_L[mask_normal],
+        alpha=0.25,
+        s=5,
+        color=colors[5],
+        # label=f"Normal (w={w_norm:.2f}, n={n_norm:,})")
+        label=f"Normal (n={n_norm:,})",
+    )
     if show_abnormal:
-        ax.scatter(d2_H[~mask_normal], d2_L[~mask_normal],
-                   alpha=0.25, s=5, color=colors[1],
-                   label=f"Abnormal (w={w_abn:.2f}, n={n_abn:,})")
+        ax.scatter(
+            d2_H[~mask_normal],
+            d2_L[~mask_normal],
+            alpha=0.25,
+            s=5,
+            color=colors[1],
+            # label=f"Abnormal (w={w_abn:.2f}, n={n_abn:,})")
+            label=f"Abnormal (n={n_abn:,})",
+        )
     else:
         ax.scatter(d2_H[~mask_normal], d2_L[~mask_normal],
                    alpha=0.1, s=3, color="gray")

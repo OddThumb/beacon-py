@@ -2,7 +2,7 @@
 # Scrap from other source codes
 from .TS import *
 from .DQ import *
-from .seqARIMA import seqarima
+from .seqARIMA import seqarima, envelope_snr
 from .plot import message_verb
 from .Calc import *
 from .etc import Rist
@@ -16,7 +16,7 @@ import polars as pl
 import pandas as pd
 
 from sklearn.cluster import DBSCAN
-from scipy.stats import poisson
+from scipy.stats import poisson, expon
 from scipy.special import lambertw
 
 # For pipe_net in running parallel
@@ -309,21 +309,103 @@ def iqr(
     )
 
 
+def snr_expon(
+    x: np.ndarray | pl.Series, quantile: float = 0.9930233967607198, max_anoms: int = 100
+) -> pl.DataFrame:
+    """
+    Detect anomalies in an envelope-SNR^2 series using the theoretical Exp(1) null.
+
+    SNR^2 = envelope(analytic signal)^2 / (2*sigma^2) is exactly Exp(1)-distributed
+    under a stationary Gaussian noise null (see seqARIMA.envelope_snr), for ANY
+    noise color -- no Monte Carlo or approximation needed. One-sided (SNR^2 >= 0).
+
+    Args:
+        x (np.ndarray or pl.Series): Input 1D SNR^2 series.
+        quantile (float): Upper-tail quantile for the Exp(1) threshold. Default
+            0.9930233967607198 is matched to iqr()'s default (alpha=0.1, i.e.
+            scale=1.5) two-sided per-sample false-alarm rate (~0.698%), so the
+            two methods are comparable at their defaults. Recompute via:
+            far = 2*(1-norm.cdf((0.5+0.15/alpha)*(norm.ppf(.75)-norm.ppf(.25))));
+            quantile = 1-far.
+        max_anoms (int): Maximum number of anomalies to report (based on largest deviation).
+
+    Returns:
+        pl.DataFrame: Table with index, value, lower/upper bounds, anomaly flags.
+    """
+    if isinstance(x, pl.Series):
+        x = x.to_numpy()
+    x = np.asarray(x)
+    n = len(x)
+
+    # Theoretical threshold from Exp(1) -- exact, not fit to this data
+    upper = expon.ppf(quantile)
+    lower = 0.0  # SNR^2 >= 0, no lower-tail anomaly
+
+    is_outlier = x > upper
+    dist = np.where(is_outlier, x - upper, 0.0)
+
+    df = pl.DataFrame(
+        {
+            "index": np.arange(n, dtype=np.uint32),
+            "value": x,
+            "limit_lower": np.full(n, lower),
+            "limit_upper": np.full(n, upper),
+            "outlier": is_outlier.astype(int),
+            "direction": np.where(is_outlier, "Up", None),
+            "sorting": dist,
+        }
+    )
+
+    df_out = df.filter(pl.col("outlier") == 1)
+    df_out = df_out.sort("sorting", descending=True).with_columns(
+        [
+            pl.Series("rank", np.arange(1, len(df_out) + 1, dtype=np.uint32)),
+            (pl.arange(1, len(df_out) + 1) <= max_anoms)
+            .cast(pl.Int8)
+            .alias("reported"),
+        ]
+    )
+
+    df_other = df.filter(pl.col("outlier") == 0).with_columns(
+        [
+            pl.lit(None, dtype=pl.UInt32).alias("rank"),
+            pl.lit(0).cast(pl.Int8).alias("reported"),
+        ]
+    )
+
+    df_final = pl.concat([df_out, df_other]).sort("index")
+
+    return df_final.select(
+        [
+            "index",
+            "value",
+            "limit_lower",
+            "limit_upper",
+            "reported",
+            "outlier",
+            "direction",
+        ]
+    )
+
+
 def anomalize(
     data: pl.DataFrame,
     target: str,
     method: str = "iqr",
     alpha: float = 0.1,
+    quantile: float = 0.9930233967607198,
     max_anoms: int = 100,
 ) -> pl.DataFrame:
     """
-    Apply anomaly detection on a specific column using IQR or GESD method.
+    Apply anomaly detection on a specific column using IQR or envelope-SNR^2 method.
 
     Args:
         data (pl.DataFrame): Input time series data.
         target (str): Column name to apply anomaly detection on.
-        method (str): Anomaly detection method, only 'iqr' is available for the moment.
-        alpha (float): Significance level for thresholding.
+        method (str): Anomaly detection method, 'iqr' or 'snr'.
+        alpha (float): Significance level for IQR thresholding (method='iqr' only).
+        quantile (float): Upper-tail Exp(1) quantile for SNR^2 thresholding
+            (method='snr' only). Default matched to alpha=0.1's FAR, see snr_expon().
         max_anoms (int): Maximum number of anomalies to flag.
 
     Returns:
@@ -335,8 +417,10 @@ def anomalize(
 
     if method == "iqr":
         outlier_table = iqr(x, alpha=alpha, max_anoms=max_anoms)
+    elif method == "snr":
+        outlier_table = snr_expon(x, quantile=quantile, max_anoms=max_anoms)
     else:
-        raise NotImplementedError("Only 'iqr' method is currently supported.")
+        raise NotImplementedError("Only 'iqr' and 'snr' methods are currently supported.")
 
     # Rename limit columns directly to match target
     lwr_col = f"{target}_l1"
@@ -364,31 +448,48 @@ def anomalize(
 
 
 def anomaly(
-    ts_obj, max_anom: int = 100, scale: float = 1.5, method: str = "iqr"
+    ts_obj,
+    max_anom: int = 100,
+    scale: float = 1.5,
+    quantile: float = 0.9930233967607198,
+    method: str = "iqr",
 ) -> pl.DataFrame:
     """
     High-level wrapper to perform anomaly detection on a ts object.
 
     Args:
-        ts_obj (ts): Time series object.
+        ts_obj (ts): Time series object. For method='snr' this must be a
+            seqarima()/pred_seqarima() result (has .ar_meta) since envelope_snr()
+            needs it.
         max_anom (int): Maximum number of anomalies to detect.
-        scale (float): Multiplier for IQR threshold; alpha = 0.15 / scale.
-        method (str): Anomaly detection method ('iqr' only).
-        tzero (float): Time alignment (unused, reserved).
+        scale (float): Multiplier for IQR threshold; alpha = 0.15 / scale. (method='iqr' only)
+        quantile (float): Upper-tail Exp(1) quantile for envelope-SNR^2 thresholding.
+            Default matched to scale=1.5's FAR, see snr_expon(). (method='snr' only)
+        method (str): Anomaly detection method ('iqr' or 'snr').
 
     Returns:
         pl.DataFrame: Anomaly detection result with bounds and flags.
     """
-    # Compute alpha from scale
-    alpha = 0.15 / scale
-
-    # Convert ts object to polars DataFrame
-    tpl = as_pl(ts_obj).rename({"x": "observed"})
-
-    # Apply anomaly detection
-    out = anomalize(
-        data=tpl, target="observed", method=method, alpha=alpha, max_anoms=max_anom
-    )
+    if method == "iqr":
+        alpha = 0.15 / scale
+        tpl = as_pl(ts_obj).rename({"x": "observed"})
+        out = anomalize(
+            data=tpl, target="observed", method="iqr", alpha=alpha, max_anoms=max_anom
+        )
+    elif method == "snr":
+        snr_ts = envelope_snr(ts_obj)
+        snr_sq = tsref(snr_ts.data ** 2, snr_ts)
+        tpl = (
+            as_pl(snr_sq)
+            .rename({"x": "snr_sq"})
+            .with_columns(pl.Series("observed", ts_obj.data))
+            .select(["time", "observed", "snr_sq"])
+        )
+        out = anomalize(
+            data=tpl, target="snr_sq", method="snr", quantile=quantile, max_anoms=max_anom
+        )
+    else:
+        raise NotImplementedError("Only 'iqr' and 'snr' methods are currently supported.")
 
     return out
 
@@ -480,13 +581,21 @@ def arch(ts_obj: ts, params: Rist, deno_params=None) -> pl.DataFrame:
     else:
         deno = pred_seqarima(ts_obj, deno_params, verbose=False)
 
-    anom = anomaly(deno, max_anom=params.nmax, scale=params.scale, method=params.method)
+    anom = anomaly(
+        deno, max_anom=params.nmax, scale=params.scale,
+        quantile=params.quantile if "quantile" in params else 0.9930233967607198,
+        method=params.method,
+    )
     clustered = run_dbscan(anom, eps=params.eps)
     raw_df = as_pl(ts_obj).rename({"x": "raw"})
     merged = clustered.join(raw_df, on="time", how="left")
 
-    base_cols = ["time", "anomaly", "cluster", "raw",
-                 "observed", "observed_l1", "observed_l2"]
+    if params.method == "snr":
+        base_cols = ["time", "anomaly", "cluster", "raw",
+                     "observed", "snr_sq", "snr_sq_l1", "snr_sq_l2"]
+    else:
+        base_cols = ["time", "anomaly", "cluster", "raw",
+                     "observed", "observed_l1", "observed_l2"]
     extra_cols = [col for col in merged.columns if col not in base_cols]
     return merged.select(base_cols + extra_cols)
 
@@ -680,6 +789,7 @@ def config_pipe(replace: Optional[Rist] = None, show_config: bool = True) -> Ris
         # _____Anomaly Clustering_____
         nmax=int(f_sampl * t_batch),
         scale=1.5,
+        quantile=0.9930233967607198,  # method="snr" only; matched to scale=1.5's FAR (~0.698%)
         method="iqr",
         decomp=None,
         eps=1 / f_sampl,
@@ -695,6 +805,7 @@ def config_pipe(replace: Optional[Rist] = None, show_config: bool = True) -> Ris
 
         # _____Autoregressive Veto_____
         feat_dim=32,
+        R=15,  # AR feature segment factor: segment = R * feat_dim / fs
         bkg_ref=None,
         fap_c=0.05,
         alpha_d=0.05,
@@ -780,6 +891,7 @@ def _format_config(config: Rist) -> str:
     lines.append("\n[Anomaly Clustering]")
     lines.append(f"  Max anomalies      : {config['nmax']}")
     lines.append(f"  IQR scale          : {config['scale']}")
+    lines.append(f"  SNR^2 quantile     : {config['quantile']} (method='snr' only)")
     lines.append(f"  Method             : {config['method']}")
     lines.append(f"  Decomposition      : {config['decomp']}")
     eps_sec = config["eps"]
@@ -1780,7 +1892,10 @@ def pipe_net(
     alpha_d = config["alpha_d"]
 
     raw_feature, classif_res, bkg_flag = ARveto(
-        res_net_updated, triggers, bkg_ref, fap_c, alpha_d
+        res_net_updated, triggers, bkg_ref, fap_c, alpha_d,
+        feat_dim=config["feat_dim"],
+        R=(config["R"] if "R" in config else 15),
+        sampling_freq=config["sampling_freq"],
     )
 
     if seqarima_mode == "on|on":
@@ -1914,6 +2029,8 @@ def stream(
     """
     dets = batch_set[0].names
     feat_dim = config["feat_dim"]
+    R = config["R"] if "R" in config else 15
+    fs = config["sampling_freq"]
     bkg_ref = config["bkg_ref"]
     is_phase1 = bkg_ref is None
     window_size = config["window_size"]
@@ -1986,7 +2103,8 @@ def stream(
                 triggers_p1 = filter_centroid_time(coinc_last)
                 if len(triggers_p1) > 0:
                     XH_i, XL_i, _, _ = extract_raw_features(
-                        res_net, triggers_p1)
+                        res_net, triggers_p1,
+                        order_max=feat_dim, seg_factor=R, sampling_freq=fs)
                     xh_accum.append(XH_i)
                     xl_accum.append(XL_i)
 
@@ -2362,7 +2480,7 @@ def cluster_coinc_triggers(coinc_res, eps=32 * 15 / 4096, min_samples=1, p0_thre
     return coinc_clust, triggers
 
 
-def collect_bkg_pool(batch_iter, feat_dim=32):
+def collect_bkg_pool(batch_iter, feat_dim=32, R=15, sampling_freq=4096):
     """Collect BKG trigger AR features across multiple batches.
 
     Args:
@@ -2382,7 +2500,9 @@ def collect_bkg_pool(batch_iter, feat_dim=32):
         if len(triggers) == 0:
             print(f"  batch {i+1}: +0 triggers")
             continue
-        XH, XL, _, _ = extract_raw_features(res_net, triggers)
+        XH, XL, _, _ = extract_raw_features(
+            res_net, triggers,
+            order_max=feat_dim, seg_factor=R, sampling_freq=sampling_freq)
         xh_list.append(XH)
         xl_list.append(XL)
         n_total = sum(len(x) for x in xh_list)
@@ -2549,7 +2669,8 @@ def is_all_bkg(classif_res):
     return {"H1": not unsafe_H.any(), "L1": not unsafe_L.any()}
 
 
-def ARveto(res_net, triggers, bkg_ref, fap_c=0.053, alpha_d=0.05):
+def ARveto(res_net, triggers, bkg_ref, fap_c=0.053, alpha_d=0.05,
+           feat_dim=32, R=15, sampling_freq=4096):
     """AR feature extraction + classification + BKG determination.
 
     Skips if no triggers or bkg_ref is None.
@@ -2567,7 +2688,9 @@ def ARveto(res_net, triggers, bkg_ref, fap_c=0.053, alpha_d=0.05):
     if len(triggers) == 0 or bkg_ref is None:
         return None, None, {"H1": True, "L1": True}
 
-    XH, XL, times, coincl_ids = extract_raw_features(res_net, triggers)
+    XH, XL, times, coincl_ids = extract_raw_features(
+        res_net, triggers,
+        order_max=feat_dim, seg_factor=R, sampling_freq=sampling_freq)
     summ_feat = get_summary_feature(XH, XL, bkg_ref)
     classif_res = classify_triggers(
         summ_feat, bkg_ref, times, coincl_ids, fap_c, alpha_d)

@@ -157,8 +157,9 @@ def extract_trigger_features(
 def extract_raw_features(
     res_net,
     triggers,
-    segment_duration=32 * 15 / 4096,
+    segment_duration=None,
     order_max=32,
+    seg_factor=15,
     ic=None,
     sampling_freq=4096,
 ):
@@ -179,6 +180,8 @@ def extract_raw_features(
 
     times = triggers["time_bin"].to_numpy()
     coincl_ids = triggers["coincl_id"].to_numpy()
+    if segment_duration is None:
+        segment_duration = order_max * seg_factor / sampling_freq  # R * N_ARC / fs
     kw = dict(segment_duration=segment_duration,
               order_max=order_max, ic=ic, rep="lar")
     XH = extract_trigger_features(

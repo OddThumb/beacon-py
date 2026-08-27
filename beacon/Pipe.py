@@ -26,6 +26,7 @@ from joblib import Parallel, delayed, parallel_backend
 # For measuring pipe_net() per each batch inside stream()
 import time
 import os
+import collections
 
 # For checkpoint saving
 import json
@@ -1788,12 +1789,14 @@ def pipe_net(
     prev_coinc_clust=None,
     use_thread: bool = True,
     verbose: bool = True,
+    recent_bufs=None,
+    ctr_state=None,
 ) -> tuple:
     """BEACON pipeline + AR veto per batch.
 
     Returns:
         (res_net, prev_batch, coinc_list, classif_res,
-         deno_parlist_upd, raw_feature, bkg_flag)
+         deno_parlist_upd, raw_feature, bkg_flag, fit_status, ctr_mon)
     """
     dets = batch_net.names
     res_list_map = {det: res_net[det].copy() for det in dets}
@@ -1835,8 +1838,18 @@ def pipe_net(
             coinc_res = None
 
     if coinc_res is not None:
+        # The coincidence clustering scale must be the feature window.  Its
+        # default (32*15/4096 = 0.1172 s) is a leftover from feat_dim=32,
+        # seg_factor=15 and does not follow the run: at feat_dim=128, R=10 the
+        # features are taken over 0.3125 s while the triggers were being split
+        # at 0.1172 s, so one disturbance became several triggers whose feature
+        # windows overlap each other.  Derived here exactly as ARveto derives
+        # it below (config["R"] with the same fallback), so the two cannot drift.
         coinc_clust, triggers = cluster_coinc_triggers(
-            coinc_res, p0_thresh = config["P_update"]
+            coinc_res, p0_thresh = config["P_update"],
+            eps = (config["feat_dim"]
+                   * (config["R"] if "R" in config else 15)
+                   / config["sampling_freq"]),
         )
     else:
         coinc_clust = None
@@ -1898,6 +1911,15 @@ def pipe_net(
         sampling_freq=config["sampling_freq"],
     )
 
+    # causal median centering: detection-side columns + DQ monitor.  The
+    # plain columns (and hence labels, is_all_bkg, the refit gating) are
+    # untouched, so enabling this cannot change the pipeline's dynamics.
+    ctr_mon = None
+    if (ctr_state is not None and classif_res is not None
+            and raw_feature is not None and len(classif_res)):
+        classif_res, ctr_mon = apply_causal_center(
+            ctr_state, raw_feature, classif_res, bkg_ref, config)
+
     if seqarima_mode == "on|on":
         deno_parlist_upd = {det: None for det in dets}
         fit_status = {det: "skip" for det in dets}
@@ -1911,6 +1933,7 @@ def pipe_net(
                     coinc_clust=coinc_clust,
                     classif_res=classif_res,
                     det=det,
+                    recent=(recent_bufs or {}).get(det),
                 )
                 for det in dets
             )
@@ -1919,7 +1942,7 @@ def pipe_net(
 
     return (res_net_updated, prev_batch, coinc_list,
             classif_res, deno_parlist_upd, raw_feature, bkg_flag,
-            fit_status)
+            fit_status, ctr_mon)
 
 
 # Streaming batch data into pipe_net
@@ -1938,6 +1961,9 @@ def _get_summary_schema(dets: List[str]) -> pa.Schema:
         ("bkg_flag", pa.bool_()),
         ("fit_status", pa.string()),
         ("eta", pa.float64()),
+        ("ctr_m2", pa.float64()),
+        ("ctr_overlap", pa.float64()),
+        ("ctr_nblk", pa.int32()),
     ])
 
 
@@ -1948,6 +1974,7 @@ def _build_summary_rows(
     bkg_flag: dict,
     eta: float,
     fit_status: dict = None,
+    ctr_mon: dict = None,
 ) -> List[dict]:
     """Build summary rows for current batch (one row per detector, includes bkg_flag)."""
     rows = []
@@ -1989,6 +2016,10 @@ def _build_summary_rows(
             "bkg_flag": bkg_flag[det],
             "fit_status": fit_status[det] if fit_status else None,
             "eta": float(eta),
+            "ctr_m2": (ctr_mon["m2H" if det == "H1" else "m2L"]
+                       if ctr_mon else None),
+            "ctr_overlap": ctr_mon["overlap"] if ctr_mon else None,
+            "ctr_nblk": ctr_mon["nblk"] if ctr_mon else None,
         })
     return rows
 
@@ -2062,6 +2093,15 @@ def stream(
         for det in dets:
             res_net[det]["ustat"] = Rist(use_model[det])
 
+    # ring buffer of (raw batch ts, anomaly intervals) for assembled refits
+    K_asm = int(config["assemble_win"]) if "assemble_win" in config and \
+        config["assemble_win"] else 0
+    recent_bufs = {det: collections.deque(maxlen=K_asm) for det in dets} \
+        if K_asm else None
+
+    # causal median centering state (None unless "center_win" in config)
+    ctr_state = ctr_state_init(config)
+
     if is_phase1:
         xh_accum, xl_accum = [], []
 
@@ -2077,7 +2117,7 @@ def stream(
         (
             res_net, prev_batch, coinc_lis,
             classif_res, deno_parlist, raw_feature, bkg_flag,
-            fit_status,
+            fit_status, ctr_mon,
         ) = pipe_net(
             batch_net=batch_set[i],
             prev_batch=prev_batch,
@@ -2088,7 +2128,16 @@ def stream(
             prev_classif_res=prev_classif_res,
             prev_coinc_clust=prev_coinc_clust,
             verbose=verbose,
+            recent_bufs=recent_bufs,
+            ctr_state=ctr_state,
         )
+
+        if recent_bufs is not None:
+            for det in dets:
+                proc_det = res_net[det]["proc"]
+                iv = _anomaly_intervals(proc_det) \
+                    if proc_det is not None and not is_all_nan(proc_det) else []
+                recent_bufs[det].append((batch_set[i][det], iv))
 
         # n_former 결정용으로 다음 iter에 carry
         prev_classif_res = classif_res
@@ -2134,7 +2183,7 @@ def stream(
                     pickle.dump(deno_parlist[det], f)
 
         summary_rows = _build_summary_rows(
-            batch_id, dets, res_net, bkg_flag, eta, fit_status)
+            batch_id, dets, res_net, bkg_flag, eta, fit_status, ctr_mon)
         summary_writer.write_table(
             pa.Table.from_pylist(summary_rows, schema=summary_schema))
 
@@ -2568,12 +2617,33 @@ def fit_bkg_reference(XH_pool, XL_pool, n_feat=32,
     neg_loglik = lambda df, data: -np.sum(chi2.logpdf(data, df))
     d2n_H = dH[mask_normal] ** 2
     d2n_L = dL[mask_normal] ** 2
-    df_mle_H = float(minimize_scalar(
-        neg_loglik, bounds=(1, 200),
-        method="bounded", args=(d2n_H,)).x)
-    df_mle_L = float(minimize_scalar(
-        neg_loglik, bounds=(1, 200),
-        method="bounded", args=(d2n_L,)).x)
+
+    def _fit_df(data, ifo):
+        """MLE chi2 dof, with a ceiling that is raised rather than returned.
+
+        d2 of a whitened n_feat-vector is chi2(n_feat), so the old fixed ceiling
+        of 200 was below the answer for every n_feat above roughly 200 and the
+        boundary came back as if it were a fit; classify_triggers then built its
+        GLC threshold from it.  The first bracket is still (1, 200) so a fit that
+        never approached the ceiling returns exactly what it always did.
+        """
+        df = float("nan")
+        for hi in (200.0, max(200.0, 5.0 * n_feat), max(200.0, 25.0 * n_feat)):
+            df = float(minimize_scalar(neg_loglik, bounds=(1.0, hi),
+                                       method="bounded", args=(data,)).x)
+            if df < hi * (1 - 1e-6):
+                if df <= 1.0 + 1e-6:
+                    print(f"[WARNING] chi2 df for {ifo} hit the lower bound 1; "
+                          f"it is not a fit, and d2-based classification from "
+                          f"this reference is invalid.")
+                return df
+        print(f"[WARNING] chi2 df for {ifo} is still at the search ceiling "
+              f"({df:.2f}); it is not a fit, and d2-based classification from "
+              f"this reference is invalid.")
+        return df
+
+    df_mle_H = _fit_df(d2n_H, "H1")
+    df_mle_L = _fit_df(d2n_L, "L1")
 
     alpha_beta = (n_feat - 1) / 2
     n_norm = int(mask_normal.sum())
@@ -2667,6 +2737,127 @@ def is_all_bkg(classif_res):
     unsafe_H = is_gw | (is_glc & np.array(["H" in d for d in details]))
     unsafe_L = is_gw | (is_glc & np.array(["L" in d for d in details]))
     return {"H1": not unsafe_H.any(), "L1": not unsafe_L.any()}
+
+
+def ctr_state_init(config):
+    """Rolling state for causal median centering; None unless enabled.
+
+    Enabled by "center_win" (seconds) in the config.  The state holds
+    coordinate-wise medians of the whitened feature vectors over blocks on the
+    absolute grid [k*blk, (k+1)*blk); a block becomes usable for a trigger at
+    time t only when the block END is at or before t - gap, so no trigger is
+    ever centered with data younger than `gap` (nothing centers itself, and
+    the correction is strictly causal).  Medians, not means: the MDC showed a
+    plain mean is biased by dense coherent injections (2026.08.11).
+    """
+    if "center_win" not in config or not config["center_win"]:
+        return None
+    return {"blocks": collections.deque(maxlen=64),
+            "buf_key": None, "bufH": [], "bufL": []}
+
+
+def _ctr_close_block(state, blk):
+    """Finalize the accumulating block into (t_end, medH, medL, n)."""
+    if state["buf_key"] is not None and len(state["bufH"]):
+        state["blocks"].append((
+            (state["buf_key"] + 1) * blk,
+            np.median(np.asarray(state["bufH"]), axis=0),
+            np.median(np.asarray(state["bufL"]), axis=0),
+            len(state["bufH"])))
+    state["bufH"], state["bufL"] = [], []
+
+
+def apply_causal_center(state, raw_feature, classif_res, bkg_ref, config):
+    """Median-centered coherence columns + DQ monitor for one batch.
+
+    Appends to classif_res:
+        C_ctr, p_C_ctr, d2H_ctr, d2L_ctr  -- centered statistic values
+        ctr_ok                            -- True where a full trailing window existed
+    Existing columns are untouched (labels and the analytic pipeline keep the
+    plain statistic; the centered columns are what detection-side aggregation
+    consumes).  Then absorbs this batch's whitened vectors into the state.
+
+    Returns (classif_res, monitor) where monitor carries the displacement the
+    batch was corrected with: {"m2H", "m2L", "overlap", "nblk"} -- the free
+    self-monitoring DQ series (overlap = m_H . m_L, the quantity a state
+    change drives many sigma positive while signals cannot move it).
+    """
+    blk = float(config["center_blk"]) if "center_blk" in config else 150.0
+    gap = float(config["center_gap"]) if "center_gap" in config else 60.0
+    win = float(config["center_win"])
+    min_n = int(config["center_min_n"]) if "center_min_n" in config else 20
+    min_b = int(config["center_min_blocks"]) if "center_min_blocks" in config else 2
+
+    times = classif_res["times"].to_numpy()
+    ZH, _ = whiten_with_bkg(raw_feature["H1"], None,
+                            mu=bkg_ref["mu_H"], S=bkg_ref["S_H"])
+    ZL, _ = whiten_with_bkg(raw_feature["L1"], None,
+                            mu=bkg_ref["mu_L"], S=bkg_ref["S_L"])
+    fin = np.isfinite(ZH).all(axis=1) & np.isfinite(ZL).all(axis=1)
+
+    # invariant: these rows must be the very rows classify_triggers scored
+    c_chk = np.einsum("ij,ij->i", ZH[fin], ZL[fin])
+    c_chk /= (np.linalg.norm(ZH[fin], axis=1) * np.linalg.norm(ZL[fin], axis=1))
+    c_ref = classif_res["C"].to_numpy()[fin]
+    if len(c_ref) and np.nanmax(np.abs(c_chk - c_ref)) > 1e-9:
+        raise RuntimeError("apply_causal_center: row order does not match "
+                           "classify_triggers output")
+
+    # offsets from PAST blocks only (state not yet updated with this batch)
+    mH = np.zeros_like(ZH)
+    mL = np.zeros_like(ZL)
+    ok = np.zeros(len(times), dtype=bool)
+    blocks = list(state["blocks"])
+    if blocks:
+        ends = np.array([b[0] for b in blocks])
+        kk = np.searchsorted(ends, times - gap, side="left")
+        for i in range(len(times)):
+            usable = [b for b in blocks[:kk[i]]
+                      if b[0] > times[i] - gap - win and b[3] >= min_n]
+            if len(usable) >= min_b:
+                mH[i] = np.mean([b[1] for b in usable], axis=0)
+                mL[i] = np.mean([b[2] for b in usable], axis=0)
+                ok[i] = True
+
+    ZHc, ZLc = ZH - mH, ZL - mL
+    nrm = np.linalg.norm(ZHc, axis=1) * np.linalg.norm(ZLc, axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        C_ctr = np.einsum("ij,ij->i", ZHc, ZLc) / nrm
+    d2H_ctr = np.einsum("ij,ij->i", ZHc, ZHc)
+    d2L_ctr = np.einsum("ij,ij->i", ZLc, ZLc)
+    ab = float(bkg_ref["alpha_beta"])
+    p_C_ctr = beta_dist.sf((C_ctr + 1.0) / 2.0, ab, ab)
+
+    classif_res = classif_res.with_columns([
+        pl.Series("C_ctr", C_ctr, dtype=pl.Float64),
+        pl.Series("p_C_ctr", p_C_ctr, dtype=pl.Float64),
+        pl.Series("d2H_ctr", d2H_ctr, dtype=pl.Float64),
+        pl.Series("d2L_ctr", d2L_ctr, dtype=pl.Float64),
+        pl.Series("ctr_ok", ok, dtype=pl.Boolean),
+    ])
+
+    # absorb this batch (time order; at most one grid boundary per 4 s batch)
+    order = np.argsort(times)
+    for i in order:
+        if not fin[i]:
+            continue
+        key = int(times[i] // blk)
+        if state["buf_key"] is None:
+            state["buf_key"] = key
+        elif key != state["buf_key"]:
+            _ctr_close_block(state, blk)
+            state["buf_key"] = key
+        state["bufH"].append(ZH[i])
+        state["bufL"].append(ZL[i])
+
+    if ok.any():
+        mh, ml = mH[ok][-1], mL[ok][-1]
+        monitor = {"m2H": float(mh @ mh), "m2L": float(ml @ ml),
+                   "overlap": float(mh @ ml), "nblk": int(len(state["blocks"]))}
+    else:
+        monitor = {"m2H": None, "m2L": None, "overlap": None,
+                   "nblk": int(len(state["blocks"]))}
+    return classif_res, monitor
 
 
 def ARveto(res_net, triggers, bkg_ref, fap_c=0.053, alpha_d=0.05,
@@ -2808,9 +2999,73 @@ def _longest_clean_ts(curr_ts, gated_ranges, min_duration_s=1.5):
     return ts(curr_ts.data[i_start:i_end], start=g_start, sampling_freq=fs)
 
 
+def _anomaly_intervals(proc):
+    """Label-free anomaly-cluster time intervals [(t0, t1), ...] of one batch.
+
+    Comes from the first DBSCAN (upstream of the AR-veto classifier), so it is
+    usable even when the classifier itself is the thing that cannot be trusted.
+    """
+    if proc is None or "cluster" not in proc.columns:
+        return []
+    cl = proc.filter(pl.col("cluster").is_not_null())
+    if cl.height == 0:
+        return []
+    g = cl.group_by("cluster").agg(pl.col("time").min().alias("a"),
+                                   pl.col("time").max().alias("b"))
+    return [(float(a), float(b)) for a, b in zip(g["a"], g["b"])]
+
+
+def _assemble_clean(recent, curr, curr_intervals, exclude_tail_s,
+                    min_s=3.0, take_s=4.0, guard=0.05):
+    """Longest contiguous anomaly-free stretch across recent batches + current.
+
+    Adjacent batches are contiguous in time, so no stitching seam exists; the
+    search window is simply extended backwards.  The last `exclude_tail_s` of
+    the current batch is excluded so it can serve as held-out validation.
+    Returns a ts of the most recent `take_s` of the best run, or None.
+    """
+    fs = curr.sampling_freq
+    pieces = list(recent or []) + [(curr, list(curr_intervals or []))]
+    kept = [pieces[-1]]
+    for p_ in reversed(pieces[:-1]):          # keep only the contiguous suffix
+        pts = p_[0]
+        if abs((pts.start + len(pts.data) / fs) - kept[0][0].start) < 0.5 / fs:
+            kept.insert(0, p_)
+        else:
+            break
+    t0 = kept[0][0].start
+    data = np.concatenate([p_[0].data for p_ in kept])
+    t1 = t0 + len(data) / fs
+    excl = [[a - guard, b + guard] for _, iv in kept for a, b in iv]
+    excl.append([curr.start + curr.duration - exclude_tail_s, t1])
+    excl.sort()
+    merged = []
+    for a, b in excl:
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    runs, prev = [], t0
+    for a, b in merged:
+        if a > prev:
+            runs.append((prev, min(a, t1)))
+        prev = max(prev, b)
+    if prev < t1:
+        runs.append((prev, t1))
+    runs = [r for r in runs if r[1] - r[0] >= min_s]
+    if not runs:
+        return None
+    a, b = runs[-1]                            # most recent qualifying run
+    a = max(a, b - take_s)
+    i0, i1 = int(round((a - t0) * fs)), int(round((b - t0) * fs))
+    for ea, eb in merged:                      # anchor: no flagged sample inside
+        assert eb <= a or ea >= b, "assembled run overlaps an excluded interval"
+    return ts(data[i0:i1], start=a, sampling_freq=fs)
+
+
 def update_deno_params(curr, config, deno_params, isbkg,
                        proc=None, coinc_clust=None, classif_res=None,
-                       det=None, min_clean_frac=0.75):
+                       det=None, min_clean_frac=0.75, recent=None):
     """Refit seqARIMA parameters based on BKG classification.
 
     - isbkg=True: refit on full batch.
@@ -2836,23 +3091,93 @@ def update_deno_params(curr, config, deno_params, isbkg,
             batch length (default 0.75). Tied to the batch, not the AR order,
             so the fit window stays long enough to generalize regardless of p.
 
+    Bounded skip (2026.08.10, off unless config carries "skip_cap"):
+        The unconditional GW-skip has no time bound, and the GW decision uses
+        C whose null depends on the model being current.  A sustained noise
+        transient can therefore lock the pipeline: stale model -> feature
+        displacement -> more GW labels -> no refit (measured twice: SNR2 arm
+        2026.07.22, 8.9 h freeze; order-128 arm 2026.08.10, 90 min freeze).
+        With "skip_cap" = N in the config, after N consecutive batches without
+        a refit a LABEL-INDEPENDENT candidate model is fitted on the first
+        3/4 of the batch (labels are exactly what cannot be trusted in the
+        locked state) and adopted only if it passes a one-directional gate on
+        the held-out last 1/4: residual variance ratio <= 3.0 and ACF-
+        whiteness ratio <= 1.5 against the incumbent (the 2026.07.22 gate
+        design).  A rejected candidate keeps the incumbent, so the worst case
+        equals the old behaviour plus one fit's CPU.
+
     Returns:
         (deno_params, fit_status) where fit_status is
-        "full" | "gated" | "skip".
+        "full" | "gated" | "skip" | "forced" (bounded-skip refit adopted).
     """
+    def _run(p):
+        return (p["_skip_run"] if (p is not None and "_skip_run" in p) else 0)
+
+    def _mark(p, n):
+        if p is not None:
+            p["_skip_run"] = n
+        return p
+
     if isbkg:
         _, deno_params = fit_seqarima(
             curr, d=config["d"], p=config["p"],
             q=config["q"], fl=config["fl"],
             fu=config["fu"], ar_ic=config["ar_ic"], verbose=False,
         )
-        return deno_params, "full"
+        return _mark(deno_params, 0), "full"
+
+    cap = config["skip_cap"] if "skip_cap" in config else None
+    run = _run(deno_params)
+
+    if cap is not None and run >= cap:
+        # -- bounded-skip forced refit: label-independent, gated, one-way --
+        # candidate construction: "assemble_win" in config selects the
+        # assembled-clean variant (legC); otherwise full-batch 3/4 (legB).
+        fs_ = curr.sampling_freq
+        n = len(curr.data)
+        n_fit = int(0.75 * n)
+        val_ts = ts(curr.data[n_fit:], start=curr.start + n_fit / fs_,
+                    sampling_freq=fs_)
+        adopted = "forced"
+        try:
+            if "assemble_win" in config and config["assemble_win"]:
+                adopted = "assembled"
+                fit_ts = _assemble_clean(
+                    recent, curr, _anomaly_intervals(proc),
+                    exclude_tail_s=(n - n_fit) / fs_,
+                )
+                if fit_ts is None:
+                    return _mark(deno_params, run + 1), "starved"
+            else:
+                fit_ts = ts(curr.data[:n_fit], start=curr.start,
+                            sampling_freq=fs_)
+            _, cand = fit_seqarima(
+                fit_ts, d=config["d"], p=config["p"],
+                q=config["q"], fl=config["fl"],
+                fu=config["fu"], ar_ic=config["ar_ic"], verbose=False,
+            )
+
+            def _metrics(params):
+                r = pred_seqarima(val_ts, params, verbose=False).data
+                r = r - r.mean()
+                v = float(r.var())
+                ac = np.correlate(r, r, "full")[len(r) - 1:len(r) + 20]
+                return v, float(np.abs(ac[1:] / (ac[0] + 1e-30)).sum())
+
+            v_c, w_c = _metrics(cand)
+            v_i, w_i = _metrics(deno_params) if deno_params is not None \
+                else (np.inf, np.inf)
+            if v_c <= 3.0 * v_i and w_c <= 1.5 * w_i:
+                return _mark(cand, 0), adopted
+        except Exception:
+            pass                      # a failed candidate never dethrones
+        return _mark(deno_params, run + 1), "rejected"
 
     if (proc is not None and coinc_clust is not None
           and classif_res is not None and det is not None):
         # GW-containing batch: skip the refit entirely (conservative).
         if (classif_res["label"].to_numpy() == "GW").any():
-            return deno_params, "skip"
+            return _mark(deno_params, run + 1), "skip"
 
         min_clean_s = min_clean_frac * len(curr.data) / curr.sampling_freq
         gated_ranges = _find_unsafe_time_ranges(
@@ -2866,9 +3191,9 @@ def update_deno_params(curr, config, deno_params, isbkg,
                 q=config["q"], fl=config["fl"],
                 fu=config["fu"], ar_ic=config["ar_ic"], verbose=False,
             )
-            return deno_params, "gated"
+            return _mark(deno_params, 0), "gated"
 
-    return deno_params, "skip"
+    return _mark(deno_params, run + 1), "skip"
 
 
 def assign_bin_ids_to_proc(proc, window_size, overlap):

@@ -1356,7 +1356,10 @@ def plot_d2_plane(d2_H, d2_L, mcd, mask_normal, iso_dsq=None, ax=None,
         plt.tight_layout(); plt.show()
 
 
-def plot_null_ref(bkg_fts, bkg_ref, figsize=(10, 4.5), save_path=None):
+def plot_null_ref(bkg_fts, bkg_ref, figsize=(10, 4.5), save_path=None, title=True,
+                  outer_wspace=0.2):
+    # outer_wspace: gap between the C panel and the d^2 corner block. This is a
+    # GridSpec-level spacing - figure-level subplots_adjust(wspace) cannot reach it.
     mask = bkg_fts["mask_normal"]
     dH_all = bkg_fts["dH"]; dL_all = bkg_fts["dL"]
     d2H_all = dH_all ** 2; d2L_all = dL_all ** 2
@@ -1376,7 +1379,7 @@ def plot_null_ref(bkg_fts, bkg_ref, figsize=(10, 4.5), save_path=None):
     print(f"  Beta: a=b={ab:.1f}")
 
     fig = plt.figure(figsize=figsize)
-    gs_outer = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.0], wspace=0.2)
+    gs_outer = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.0], wspace=outer_wspace)
     ax_C = fig.add_subplot(gs_outer[0])
     gs_corner = gs_outer[1].subgridspec(
         2, 2, wspace=0.04, hspace=0.04,
@@ -1399,7 +1402,7 @@ def plot_null_ref(bkg_fts, bkg_ref, figsize=(10, 4.5), save_path=None):
     ax_C.hist(C, bins=c_bins, density=True,
               histtype="step", color=colors[5], linewidth=2.0, zorder=4,
               label=f"NOS (n={len(C):,})")
-    ax_C.set(xlabel="C", ylabel="density")
+    ax_C.set(xlabel="$C$", ylabel="density")
     ax_C.legend(fontsize=8)
     ax_C.grid(True, alpha=0.3)
 
@@ -1460,11 +1463,15 @@ def plot_null_ref(bkg_fts, bkg_ref, figsize=(10, 4.5), save_path=None):
     ax_dH.set_xlabel("")
     ax_dL.set_ylabel("")
 
-    fig.suptitle(f"Null Reference (n={n_norm:,})", fontsize=13)
+    if title:   # paper figures are captioned in the manuscript, not on the canvas
+        fig.suptitle(f"Null Reference (n={n_norm:,})", fontsize=13)
     plt.tight_layout()
     if save_path is not None:
         fig.savefig(save_path, bbox_inches="tight", dpi=300)
     plt.show()
+    # show() closes the figure under the inline backend, so a later plt.gcf()
+    # grabs a fresh empty canvas; hand the real figure back for re-saving
+    return fig
 
 
 def _draw_d2_panel(ax, d2_train, d2_new, labels, df_mle, ifo_label,
@@ -1864,6 +1871,13 @@ def place_trigger_labels(ax, fig, items, base_x, base_y, row_gap_frac=0.35,
     base_x, base_y: coinc net-S curve (x rel to t0, S data units).
     """
     from matplotlib.patches import BoxStyle
+
+    # A batch can legitimately contain no labelled trigger: the caller draws a
+    # box for GW and GLC only and omits BKG, so an all-BKG batch arrives here
+    # with items == [].  layout() then reduces max() over an empty sequence and
+    # the whole figure dies.  Nothing to place, so return.
+    if not items:
+        return
 
     class _RoundTop(BoxStyle.Round):           # 상단 패딩만 추가 (top-only pad)
         # mathtext 라인이 섞이면 블록 윗줄 ascent 예약폭이 ~0.2*fontsize 깎여

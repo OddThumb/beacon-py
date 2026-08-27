@@ -1649,7 +1649,16 @@ def pred_seqarima(
             warnings.warn("Zero-phase correction is not supported for ensemble AR. Skipping.")
         else:
             _fs = ts_obj.sampling_freq
-            _d_order = out.diff_meta.d_order if (hasattr(out, "diff_meta") and out.diff_meta is not None) else None
+            # Read d from `params`, not from `out.diff_meta`: pred_resid() returns a
+            # fresh ts without inherit_ts_attrs(), so diff_meta is already lost here
+            # and the lookup silently fell back to AR-only phase correction. The
+            # uncorrected differencing group delay then appears as a differential
+            # (d_L - d_H) sample bias between two detectors whitened with different d
+            # (measured at 4096 Hz: d=1 vs d=2 -> -0.249 ms; equal d -> ~0).
+            if has_param(params, "d") and params.d > 0:
+                _d_order = params.d
+            else:
+                _d_order = out.diff_meta.d_order if (hasattr(out, "diff_meta") and out.diff_meta is not None) else None
             _ar_coef = out.ar_meta.ar_coef
             if _d_order is not None:
                 H_func = lambda f: H_diff(f, _fs, _d_order) * H_ar(f, _fs, _ar_coef)

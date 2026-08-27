@@ -370,7 +370,7 @@ def Differencing(
 # Estimate AR model coefficients using Burg's method
 def burgar(
     x: Union[np.ndarray, Sequence[float]],
-    ic: str = "AIC",
+    ic: str = "HQIC",
     order_max: Optional[int] = None,
     demean: bool = True,
     var_method: int = 2,
@@ -587,7 +587,7 @@ def pred_resid(ts_obj, arcoef, zero_phase=False):
 
 def sar(
     ts_obj: ts,
-    ic: str = "AIC",
+    ic: str = "HQIC",
     order_max: Optional[int] = None,
     zero_phase: bool = False,
     **kwargs: Any,
@@ -723,7 +723,7 @@ def ear(
 def Autoregressive(
     ts_obj: ts,
     p: Union[int, Sequence[int]],
-    ic: str = "AIC",
+    ic: str = "HQIC",
     verbose: bool = True,
     ar_collector: str = "median",
     zero_phase: bool = False,
@@ -1165,7 +1165,7 @@ def seqarima(
     diff_frac: bool = False,
     ar_collector: str = "mean",
     ma_collector: str = "mean",
-    ar_ic: str = "AIC",
+    ar_ic: str = "HQIC",
     zero_phase: bool = True,
     verbose: bool = True,
 ) -> ts:

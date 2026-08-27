@@ -784,7 +784,7 @@ def config_pipe(replace: Optional[Rist] = None, show_config: bool = True) -> Ris
         fu=512,
         seqarima_mode="on|off",  # "on|off": cache params (default).
                                   # "on|on": refit every batch (v7 behavior).
-        ar_ic="AIC",  # AR order-selection criterion (burgar ic): "AIC" | "BIC"
+        ar_ic="HQIC",  # AR order-selection criterion (burgar ic): "AIC" | "BIC"
                        # | "HQIC" | "FPE" | "AICc" | "KIC" | "AKICc". p = order_max.
 
         # _____Anomaly Clustering_____

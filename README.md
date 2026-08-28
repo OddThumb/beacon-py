@@ -60,6 +60,15 @@ pip install .
 
 A C compiler is required to build the Burg AR extension.
 
+## Examples
+
+Runnable notebooks live in [`examples/`](examples/). They fetch their data from GWOSC, so
+nothing needs to be downloaded first.
+
+| notebook | what it covers |
+|---|---|
+| [`seqarima_denoising.ipynb`](examples/seqarima_denoising.ipynb) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/OddThumb/beacon-py/blob/main/examples/seqarima_denoising.ipynb) | Fits the seqARIMA noise model off-source, whitens GW150914, and verifies the model against the measured spectrum. Denoising stage only. |
+
 ## Requirements
 
 - Python 3.10+
